@@ -24,10 +24,10 @@ class PlaylistSaveRequest(BaseModel):
 
 app = FastAPI()
 
-CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
-CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
-REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI")
-SCOPE = os.getenv("SPOTIFY_SCOPE")
+CLIENT_ID = os.getenv("CLIENT_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+REDIRECT_URI = os.getenv("REDIRECT_URI")
+SCOPE = os.getenv("SCOPE")
 
 app.add_middleware(
     CORSMiddleware,
