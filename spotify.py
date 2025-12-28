@@ -60,7 +60,6 @@ def callback(code: str):
 
 
 @app.get("/recommend")
-@app.get("/recommend")
 async def recommend(token: str, size: int = Query(50, ge=30, le=50)):
     sp = spotipy.Spotify(auth=token, requests_timeout=10, retries=3)
     now = datetime.datetime.now()
@@ -114,7 +113,7 @@ async def recommend(token: str, size: int = Query(50, ge=30, le=50)):
             raise HTTPException(status_code=400, detail="Not enough history to generate seeds.")
 
         # C. Expand Pool via Related Artists (Discovery)
-        discovery_seeds = random.sample(list(seed_artist_ids), min(len(seed_artist_ids), 15))
+        discovery_seeds = random.sample(list(seed_artist_ids), min(len(seed_artist_ids), 5))
         expanded_artist_pool = list(seed_artist_ids)
 
         for a_id in discovery_seeds:
