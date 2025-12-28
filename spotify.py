@@ -24,7 +24,7 @@ class PlaylistSaveRequest(BaseModel):
 
 app = FastAPI()
 
-#CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
+CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
 CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI")
 SCOPE = os.getenv("SPOTIFY_SCOPE")
@@ -56,7 +56,7 @@ def login():
 def callback(code: str):
     token_info = sp_oauth.get_access_token(code)
     access_token = token_info['access_token']
-    return RedirectResponse(url=f"http://localhost:8080/home?token={access_token}")
+    return RedirectResponse(url=f"https://spotify-playlist-curator.vercel.app/home?token={access_token}")
 
 
 @app.get("/recommend")
