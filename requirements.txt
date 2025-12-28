@@ -1,0 +1,9 @@
+pandas~=2.3.3
+numpy~=2.4.0
+scikit-learn~=1.8.0
+xgboost~=3.1.2
+tqdm~=4.67.1
+joblib~=1.5.3
+lightgbm~=4.6.0
+fastapi~=0.127.1
+spotipy~=2.25.2
