@@ -2,6 +2,7 @@ import os
 from dotenv import load_dotenv
 import datetime
 import random
+from collections import Counter
 import pandas as pd
 import spotipy
 import xgboost as xgb
@@ -73,13 +74,15 @@ async def recommend(token: str, size: int = Query(50, ge=30, le=50)):
     elif (now.hour >= 22 or now.hour < 5):
         ngt = 1
 
-    # --- 1. DATA FETCHING (EXPANDED POOL & DEEP MEMORY) ---
+    # --- 1. DATA FETCHING (IMPROVED: FREQUENCY-BASED SEEDING) ---
     positives = []
     negatives = []
-    seed_artist_ids = set()
+
+    # We will track all artist IDs found in positives to count them later
+    all_artist_ids = []
 
     try:
-        # A. Gather Positives from 4 Sources (Deep Training Data)
+        # A. Gather Positives from 4 Sources
         recent_res = sp.current_user_recently_played(limit=50)
         top_short = sp.current_user_top_tracks(limit=50, time_range='short_term')
         top_medium = sp.current_user_top_tracks(limit=50, time_range='medium_term')
@@ -91,42 +94,57 @@ async def recommend(token: str, size: int = Query(50, ge=30, le=50)):
         if top_medium: raw_positives.extend(top_medium['items'])
         if liked_res: raw_positives.extend([item['track'] for item in liked_res['items']])
 
-        # Deduplicate Positives and Extract Seeds
+        # Deduplicate Positives and Collect Artist Frequencies
         seen_pos_ids = set()
         final_positives = []
+
         for track in raw_positives:
+            # Skip invalid tracks or local files
+            if not track or not track.get('id'):
+                continue
+
             if track['id'] not in seen_pos_ids:
                 final_positives.append(track)
                 seen_pos_ids.add(track['id'])
+
+                # Collect primary artist ID for frequency analysis
                 if track['artists']:
-                    seed_artist_ids.add(track['artists'][0]['id'])
+                    all_artist_ids.append(track['artists'][0]['id'])
 
         positives = final_positives
 
-        # B. Additional Seeds from Top Artists
-        top_arts = sp.current_user_top_artists(limit=20, time_range='medium_term')
-        if top_arts:
-            for a in top_arts['items']:
-                seed_artist_ids.add(a['id'])
-
-        if not seed_artist_ids:
+        if not all_artist_ids:
             raise HTTPException(status_code=400, detail="Not enough history to generate seeds.")
 
-        # C. Expand Pool via Related Artists (Discovery)
-        discovery_seeds = random.sample(list(seed_artist_ids), min(len(seed_artist_ids), 5))
-        expanded_artist_pool = list(seed_artist_ids)
+        # B. Identify "Heavy Hitters" (Top 5 Most Frequent Artists)
+        # This replaces the generic 'sp.current_user_top_artists' call
+        artist_counts = Counter(all_artist_ids)
 
-        for a_id in discovery_seeds:
+        # Get the top 5 most common artist IDs
+        top_frequent_artists = [artist_id for artist_id, count in artist_counts.most_common(5)]
+
+        # C. Controlled Diversification (Expand Pool)
+        # We start with our Heavy Hitters to ensure the core vibe is present
+        expanded_artist_pool = list(top_frequent_artists)
+
+        # We find related artists ONLY for these heavy hitters
+        # This keeps the 'diversity' relevant to what you are actually listening to.
+        for a_id in top_frequent_artists:
             try:
                 related = sp.artist_related_artists(a_id)['artists']
-                expanded_artist_pool.extend([r['id'] for r in related[:5]])
+                # Take top 3 related artists per heavy hitter (Don't dilute too much)
+                expanded_artist_pool.extend([r['id'] for r in related[:3]])
             except:
                 continue
 
+        # Remove duplicates from the artist pool
+        final_seed_artists = list(set(expanded_artist_pool))
+
         # D. Collect Candidate Tracks (Potential Recommendations)
-        final_artists = list(set(expanded_artist_pool))[:15]
-        for a_id in final_artists:
+        # We fetch top tracks for this curated list of artists
+        for a_id in final_seed_artists:
             try:
+                # We can grab up to 10 top tracks per artist
                 artist_tracks = sp.artist_top_tracks(a_id)['tracks']
                 negatives.extend(artist_tracks)
             except:
@@ -138,6 +156,8 @@ async def recommend(token: str, size: int = Query(50, ge=30, le=50)):
 
     if not positives or not negatives:
         raise HTTPException(status_code=400, detail="Could not build recommendation pool.")
+
+    # ... (Step 2 and 3: Feature Engineering and Model Training remain exactly the same) ...
 
     # --- 2. REAL-TIME AI TRAINING ---
     training_data = []
