@@ -62,7 +62,21 @@ def callback(code: str):
 
 @app.get("/recommend")
 async def recommend(token: str, size: int = Query(50, ge=30, le=50)):
-    sp = spotipy.Spotify(auth=token, requests_timeout=10, retries=3)
+    auth_manager = SpotifyOAuth(
+        client_id=CLIENT_ID,
+        client_secret=CLIENT_SECRET,
+        redirect_uri=REDIRECT_URI,
+        scope=SCOPE,
+        cache_handler=None
+    )
+
+    auth_manager.token_info = {
+        "access_token": token,
+        "token_type": "Bearer",
+        "expires_in": 3600,
+    }
+
+    sp = spotipy.Spotify(auth_manager=auth_manager, requests_timeout=10, retries=3)
     now = datetime.datetime.now()
 
     # Time Features
