@@ -104,27 +104,38 @@ async def recommend(token: str, size: int = Query(50, ge=10, le=100)):
     sp = spotipy.Spotify(auth=token)
 
     try:
-        # A. Get CURRENT user's preferences to use as "Context"
-        # We get their top artists to see if the new songs match their taste
+        # 1. Fetch more top artists to have a wider search net
         user_top = sp.current_user_top_artists(limit=20, time_range='medium_term')['items']
+        if not user_top:
+            raise HTTPException(status_code=400, detail="Not enough user data to generate seeds.")
+
         top_artist_names = [a['name'] for a in user_top]
-        seed_ids = [a['id'] for a in user_top[:5]]  # Use top 5 as seeds for discovery
 
-        # B. Fetch candidates from Spotify Recommendations
-        # This gives us a pool of songs similar to their current favorites
-        raw_recs = sp.recommendations(seed_artists=seed_ids, limit=size + 20)
-        candidates = raw_recs['tracks']
+        # 2. INCREASE THE POOL SAFELY
+        candidate_pool = {}
 
-        # C. Rank candidates using YOUR AI Model
+        # We take the top 10 artists and fetch in 2 batches of 5 seeds each
+        # Spotify allows max 5 seeds per request.
+        seed_groups = [user_top[i:i + 5] for i in range(0, 10, 5)]
+
+        for group in seed_groups:
+            group_ids = [artist['id'] for artist in group]
+
+            # Use 50 as the limit (safe for all Spotify versions)
+            # Ensure seed_artists is a LIST, not a string
+            raw_recs = sp.recommendations(seed_artists=group_ids, limit=50)
+
+            for track in raw_recs['tracks']:
+                # Deduplicate by track ID
+                candidate_pool[track['id']] = track
+
+        # 3. RANKING LOGIC (The AI part)
         now = datetime.datetime.now()
         feature_rows = []
         meta = []
 
-        for track in candidates:
-            # Skip if we don't have enough data on the track
-            if not track.get('id'): continue
-
-            # Extract the 7 features for this specific user
+        for track_id, track in candidate_pool.items():
+            # Extract features for each candidate
             feats = extract_features_dynamic(track, now, top_artist_names)
             feature_rows.append(feats)
 
@@ -136,22 +147,29 @@ async def recommend(token: str, size: int = Query(50, ge=10, le=100)):
                 "albumArt": track['album']['images'][0]['url'] if track['album']['images'] else ""
             })
 
-        # D. Run Model Prediction
+        if not feature_rows:
+            return {"recommendations": []}
+
+        # 4. CONVERT TO DATAFRAME FOR PREDICTION
         cols = ['day_of_week', 'artist_global_plays', 'user_affinity', 'track_context_weight',
                 'time_bucket_afternoon', 'time_bucket_evening', 'time_bucket_night']
         X_pred = pd.DataFrame(feature_rows, columns=cols)
 
-        # Ensemble Scores
-        scores = (model_xgb.predict_proba(X_pred)[:, 1] + model_lgbm.predict_proba(X_pred)[:, 1]) / 2
+        # Predict using your fine-tuned ensemble
+        p_xgb = model_xgb.predict_proba(X_pred)[:, 1]
+        p_lgbm = model_lgbm.predict_proba(X_pred)[:, 1]
+        scores = (p_xgb + p_lgbm) / 2
 
-        # Attach scores and sort
         for i in range(len(meta)):
             meta[i]['score'] = float(scores[i])
 
+        # Sort by score and return the requested 'size'
         final_list = sorted(meta, key=lambda x: x['score'], reverse=True)[:size]
+
         return {"recommendations": final_list}
 
     except Exception as e:
+        print(f"Detailed Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
