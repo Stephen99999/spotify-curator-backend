@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
 
+
 # --- MODELS ---
 class PlaylistSaveRequest(BaseModel):
     token: str
@@ -88,50 +89,67 @@ def callback(code: str):
 async def recommend(token: str, size: int = Query(50, ge=30, le=50)):
     # Initialize Spotify
     sp = spotipy.Spotify(auth=token)
-    # Critical Fix for Google Cloud/Proxy environments
-    sp.prefix = "https://api.spotify.com/v1/"
 
     now = datetime.datetime.now()
     day = now.weekday()
     # Time bucket features
     aft, eve, ngt = (1, 0, 0) if 12 <= now.hour < 17 else (0, 1, 0) if 17 <= now.hour < 22 else (0, 0, 1) if (
-                now.hour >= 22 or now.hour < 5) else (0, 0, 0)
+            now.hour >= 22 or now.hour < 5) else (0, 0, 0)
 
     try:
         # --- 1. DATA FETCHING ---
-        # Get user context
+        print("📊 Fetching user data...")
         recent = sp.current_user_recently_played(limit=20).get('items', [])
+        print(f"   Recent tracks: {len(recent)}")
+
         top_tracks = sp.current_user_top_tracks(limit=20, time_range='short_term').get('items', [])
+        print(f"   Top tracks: {len(top_tracks)}")
+
         liked = sp.current_user_saved_tracks(limit=20).get('items', [])
+        print(f"   Liked tracks: {len(liked)}")
 
         # Collect unique IDs to avoid recommending what they just heard
         seen_ids = set([t['track']['id'] for t in recent if t.get('track')] +
                        [t['id'] for t in top_tracks] +
                        [t['track']['id'] for t in liked if t.get('track')])
+        print(f"   Seen IDs: {len(seen_ids)}")
 
         # Identify "Heavy Hitter" Artists for seed generation
         artist_ids = [t['track']['artists'][0]['id'] for t in recent if t.get('track')] + \
                      [t['artists'][0]['id'] for t in top_tracks]
         heavy_hitters = [a_id for a_id, count in Counter(artist_ids).most_common(5)]
+        print(f"   Heavy hitters: {len(heavy_hitters)}")
 
         # --- 2. CANDIDATE GENERATION ---
         candidates = {}
-        for a_id in heavy_hitters:
+        for idx, a_id in enumerate(heavy_hitters):
             try:
+                print(f"   Processing artist {idx + 1}/{len(heavy_hitters)}: {a_id}")
                 related = sp.artist_related_artists(a_id).get('artists', [])[:3]
+                print(f"      Found {len(related)} related artists")
+
                 for rel in related:
                     top_rel = sp.artist_top_tracks(rel['id']).get('tracks', [])[:10]
                     for track in top_rel:
                         if track['id'] not in seen_ids:
                             candidates[track['id']] = track
-            except:
+                print(f"      Total candidates so far: {len(candidates)}")
+            except Exception as e:
+                print(f"      ❌ Error with artist {a_id}: {e}")
                 continue
+
+        print(f"✅ Total candidates before fallback: {len(candidates)}")
 
         # --- 3. SAFETY FALLBACK ---
         # If no candidates found, grab a generic playlist to prevent 'null' return
         if not candidates:
-            fallback = sp.playlist_tracks("37i9dQZEVXbMDoHDwfs2t3", limit=size)
-            candidates = {item['track']['id']: item['track'] for item in fallback['items'] if item.get('track')}
+            print("⚠️  No candidates found, using fallback playlist...")
+            try:
+                fallback = sp.playlist_tracks("37i9dQZEVXbMDoHDwfs2t3", limit=size)
+                candidates = {item['track']['id']: item['track'] for item in fallback['items'] if item.get('track')}
+                print(f"   Fallback provided {len(candidates)} tracks")
+            except Exception as e:
+                print(f"   ❌ Fallback also failed: {e}")
 
         # --- 4. AI RANKING ---
         meta = []
@@ -158,12 +176,16 @@ async def recommend(token: str, size: int = Query(50, ge=30, le=50)):
         for i in range(len(meta)):
             meta[i]['score'] = float(scores[i])
 
+        print(f"🎵 Returning {len(meta)} recommendations")
         return {"recommendations": sorted(meta, key=lambda x: x['score'], reverse=True)[:size]}
 
     except Exception as e:
-        print(f"Backend Error: {e}")
+        print(f"❌ Backend Error: {e}")
+        import traceback
+        traceback.print_exc()
         # THIS IS THE CRITICAL PART: Never return None, always return the structure the frontend expects
         return {"recommendations": []}
+
 
 @app.post("/save-playlist")
 async def save_playlist(request: PlaylistSaveRequest):
