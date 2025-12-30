@@ -278,7 +278,7 @@ async def recommend(token: str, size: int = Query(50, ge=30, le=50)):
                 # Get related artists
                 related = sp.artist_related_artists(artist_id)['artists']
 
-                for rel_artist in related[:5]:  # Top 5 related per seed
+                for rel_artist in related[:10]:  # Top 5 related per seed
                     rel_id = rel_artist['id']
                     if rel_id not in related_artist_cache:
                         related_artist_cache.add(rel_id)
