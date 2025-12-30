@@ -102,82 +102,98 @@ def callback(code: str):
 @app.get("/recommend")
 async def recommend(token: str, size: int = Query(50, ge=10, le=100)):
     sp = spotipy.Spotify(auth=token)
+    # Fix for the 404 redirection issue in certain IDEs
+    sp.prefix = "https://api.spotify.com/v1/"
+
     now = datetime.datetime.now()
 
     try:
-        # --- 1. GATHER CONTEXT (Recently Played, Top Artists, Liked Songs) ---
-        # Fetching Top Artists
-        top_res = sp.current_user_top_artists(limit=10, time_range='medium_term')['items']
-        # Fetching Recently Played
-        recent_res = sp.current_user_recently_played(limit=20)['items']
-        # Fetching Liked Songs
-        liked_res = sp.current_user_saved_tracks(limit=20)['items']
+        # --- 1. GATHER CONTEXT ---
+        try:
+            top_res = sp.current_user_top_artists(limit=10)['items']
+        except:
+            top_res = []
 
-        # Collect all artist names the user currently likes/listens to
-        # This is used to calculate the 'user_affinity' feature
-        top_artist_names = set([a['name'] for a in top_res])
-        for item in recent_res: top_artist_names.add(item['track']['artists'][0]['name'])
-        for item in liked_res: top_artist_names.add(item['track']['artists'][0]['name'])
+        try:
+            recent_res = sp.current_user_recently_played(limit=10)['items']
+        except:
+            recent_res = []
 
-        # --- 2. BUILD THE CANDIDATE POOL ---
+        try:
+            # FETCH LIKED SONGS
+            liked_res = sp.current_user_saved_tracks(limit=15)['items']
+        except:
+            liked_res = []
+
+        # --- 2. BUILD THE SEED POOL (Including Liked Songs) ---
+        seed_artists = []
+        top_artist_names = set()
+
+        # Add Top Artists
+        if top_res:
+            seed_artists.extend(top_res[:5])
+            top_artist_names.update([a['name'] for a in top_res])
+
+        # Add Recently Played Artists
+        if recent_res:
+            recent_artists = [item['track']['artists'][0] for item in recent_res[:5]]
+            seed_artists.extend(recent_artists)
+            top_artist_names.update([a['name'] for a in recent_artists])
+
+        # ADD LIKED SONG ARTISTS (The missing piece!)
+        if liked_res:
+            liked_artists = [item['track']['artists'][0] for item in liked_res[:5]]
+            seed_artists.extend(liked_artists)
+            top_artist_names.update([a['name'] for a in liked_artists])
+
+        # --- 3. FETCH CANDIDATES ---
         candidates = {}
+        processed_ids = set()
 
-        # Combine different sources for variety
-        # Source A: Related to Top Artists
-        seed_artists = top_res[:5]
-
-        # Source B: Related to Recently Played Artists
-        for item in recent_res[:5]:
-            seed_artists.append(item['track']['artists'][0])
-
-        # Source C: Related to Artists from Liked Songs
-        for item in liked_res[:5]:
-            seed_artists.append(item['track']['artists'][0])
-
-        # Deduplicate seeds and fetch related artist top tracks
-        seen_seeds = set()
         for artist in seed_artists:
-            a_id = artist['id']
-            if a_id in seen_seeds: continue
-            seen_seeds.add(a_id)
+            a_id = artist.get('id')
+            if not a_id or a_id in processed_ids: continue
+            processed_ids.add(a_id)
 
             try:
-                related = sp.artist_related_artists(a_id)['artists'][:3]  # Top 3 related
-                for rel_artist in related:
-                    rel_tracks = sp.artist_top_tracks(rel_artist['id'])['tracks'][:5]  # 5 songs each
-                    for track in rel_tracks:
-                        # Don't recommend songs the user already has in their 'Recently Played'
+                # Get artists similar to your Liked/Top/Recent artists
+                related = sp.artist_related_artists(a_id)['artists'][:3]
+                for rel in related:
+                    # Get their best tracks
+                    top_tracks = sp.artist_top_tracks(rel['id'])['tracks'][:5]
+                    for track in top_tracks:
                         candidates[track['id']] = track
             except:
                 continue
 
+        # Fallback if the pool is still empty
         if not candidates:
-            raise HTTPException(status_code=404, detail="Could not build recommendation pool.")
+            fallback = sp.playlist_tracks("37i9dQZEVXbMDoHDwfs2t3", limit=30)
+            for item in fallback['items']:
+                t = item['track']
+                candidates[t['id']] = t
 
-        # --- 3. AI RANKING ---
+        # --- 4. AI RANKING ---
         feature_rows = []
         meta = []
-        candidate_list = list(candidates.values())
-
-        for track in candidate_list:
-            # Check if this artist is one of the user's favorites
+        for tid, track in candidates.items():
             feats = extract_features_dynamic(track, now, list(top_artist_names))
             feature_rows.append(feats)
-
             meta.append({
-                "id": track['id'],
-                "name": track['name'],
-                "artist": track['artists'][0]['name'],
+                "id": track['id'], "name": track['name'], "artist": track['artists'][0]['name'],
                 "url": track['external_urls']['spotify'],
                 "albumArt": track['album']['images'][0]['url'] if track['album']['images'] else ""
             })
 
-        # Predict
-        cols = ['day_of_week', 'artist_global_plays', 'user_affinity', 'track_context_weight',
-                'time_bucket_afternoon', 'time_bucket_evening', 'time_bucket_night']
-        X_pred = pd.DataFrame(feature_rows, columns=cols)
+        # Process through your fine-tuned model
+        X_pred = pd.DataFrame(feature_rows,
+                              columns=['day_of_week', 'artist_global_plays', 'user_affinity', 'track_context_weight',
+                                       'time_bucket_afternoon', 'time_bucket_evening', 'time_bucket_night'])
 
-        scores = (model_xgb.predict_proba(X_pred)[:, 1] + model_lgbm.predict_proba(X_pred)[:, 1]) / 2
+        # Ensemble Prediction
+        p_xgb = model_xgb.predict_proba(X_pred)[:, 1]
+        p_lgbm = model_lgbm.predict_proba(X_pred)[:, 1]
+        scores = (p_xgb + p_lgbm) / 2
 
         for i in range(len(meta)):
             meta[i]['score'] = float(scores[i])
@@ -185,8 +201,8 @@ async def recommend(token: str, size: int = Query(50, ge=10, le=100)):
         return {"recommendations": sorted(meta, key=lambda x: x['score'], reverse=True)[:size]}
 
     except Exception as e:
-        print(f"Fetch Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Server Error: {e}")
+        raise HTTPException(status_code=500, detail="Recommendation Engine Failed.")
 
 
 @app.post("/save-playlist")
