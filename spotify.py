@@ -308,12 +308,15 @@ async def recommend(token: str, size: int = Query(50, ge=30, le=50)):
     prediction_rows = []
     meta = []
 
+    # Shuffle candidate pool for variety on regeneration
+    random.shuffle(candidate_pool)
+
     for track in candidate_pool:
         if not track or not track.get('id'):
             continue
 
-        # Skip tracks user already has
-        if track['id'] in seen_track_ids:
+        # Allow some previously heard tracks for regeneration variety (80% filter)
+        if track['id'] in seen_track_ids and random.random() < 0.8:
             continue
 
         track_id = track['id']
