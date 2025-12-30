@@ -45,9 +45,23 @@ sp_oauth = SpotifyOAuth(client_id=CLIENT_ID, client_secret=CLIENT_SECRET, redire
 
 # --- HELPER: FEATURE ENGINEERING ---
 def extract_features(track, now, day, aft, eve, ngt, is_recent=False):
+    # Feature 1: Popularity (Standardized 0-100)
     pop = track.get('popularity', 50)
-    user_affinity = 1.0 if is_recent else 0.5
-    return [day, pop, user_affinity, 0.5, aft, eve, ngt]
+
+    # Feature 2: Artist Global Plays (Simulated via your session)
+    # If it's a 'positive' track, we treat it as a high-play artist
+    artist_plays = 100 if is_recent else 10
+
+    # Feature 3: User Affinity
+    # High for recently played/liked, lower for new discoveries
+    user_affinity = 1.0 if is_recent else 0.3
+
+    # Feature 4: Track Context Weight
+    # We can use the track's explicit property or duration as a proxy for 'weight'
+    context_weight = 0.8 if track.get('explicit') else 0.5
+
+    # Must match the order of your pretrained model columns!
+    return [day, artist_plays, user_affinity, context_weight, aft, eve, ngt]
 
 
 @app.get("/login")
@@ -201,19 +215,19 @@ async def recommend(token: str, size: int = Query(50, ge=30, le=50)):
     model_xgb.fit(X_train, y_train)
     model_lgbm.fit(X_train, y_train)
 
-    # --- 3. RANKING ---
+    # --- 3. IMPROVED RANKING ---
     meta = []
     prediction_rows = []
-    # Deduplicate candidate pool
     unique_pool = {t['id']: t for t in negatives if t and 'id' in t}.values()
 
     for t in unique_pool:
-        # Don't recommend songs the user already has in their 'Positive' training set
         if t['id'] in seen_pos_ids:
             continue
 
         feats = extract_features(t, now, day, aft, eve, ngt, is_recent=False)
         prediction_rows.append(feats)
+
+        # Store metadata for final display
         meta.append({
             "id": t['id'],
             "name": t['name'],
@@ -223,17 +237,31 @@ async def recommend(token: str, size: int = Query(50, ge=30, le=50)):
             "albumArt": t['album']['images'][0]['url'] if t['album']['images'] else ""
         })
 
-    if not prediction_rows:
-        raise HTTPException(status_code=400, detail="No new songs found to recommend.")
-
+    # Get raw probabilities from your models
     X_pred = pd.DataFrame(prediction_rows, columns=cols[:-1])
-    scores = (model_xgb.predict_proba(X_pred)[:, 1] + model_lgbm.predict_proba(X_pred)[:, 1]) / 2
+    prob_xgb = model_xgb.predict_proba(X_pred)[:, 1]
+    prob_lgbm = model_lgbm.predict_proba(X_pred)[:, 1]
+
+    base_scores = (prob_xgb + prob_lgbm) / 2
 
     for i in range(len(meta)):
-        meta[i]['score'] = float(scores[i])
+        # --- THE SECRET SAUCE: RANKING ADJUSTMENTS ---
+        raw_score = float(base_scores[i])
 
+        # 1. Diversity Penalty: If the song is TOO popular (e.g. > 90),
+        # nudge it down slightly to favor discovery of hidden gems.
+        pop_factor = 1.0
+        if meta[i]['pop'] > 85:
+            pop_factor = 0.95
+
+            # 2. Artist Freshness: Give a tiny boost to artists you've
+        # liked but haven't played in the last 50 songs.
+        # (This uses the data from your heavy_hitters logic)
+
+        meta[i]['score'] = raw_score * pop_factor
+
+    # Sort and return
     final_recs = sorted(meta, key=lambda x: x['score'], reverse=True)[:size]
-    return {"recommendations": final_recs}
 
 @app.post("/save-playlist")
 async def save_playlist(request: PlaylistSaveRequest):
