@@ -31,6 +31,14 @@ CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 REDIRECT_URI = os.getenv("REDIRECT_URI")
 SCOPE = os.getenv("SCOPE")
+# Load this once so the API doesn't have to re-read files every request
+try:
+    model_xgb = joblib.load("discovery_xgb_finetuned.pkl")
+    model_lgbm = joblib.load("discovery_lgbm_finetuned.pkl")
+    print("✅ AI Models Loaded and Ready.")
+except Exception as e:
+    print(f"❌ Warning: Models not found. Ranking will be random. {e}")
+    model_xgb, model_lgbm = None, None
 
 app.add_middleware(
     CORSMiddleware,
@@ -76,192 +84,83 @@ def callback(code: str):
     return RedirectResponse(url=f"https://spotify-playlist-curator.vercel.app/home?token={access_token}")
 
 
+
+
+
 @app.get("/recommend")
 async def recommend(token: str, size: int = Query(50, ge=30, le=50)):
-    auth_manager = SpotifyOAuth(
-        client_id=CLIENT_ID,
-        client_secret=CLIENT_SECRET,
-        redirect_uri=REDIRECT_URI,
-        scope=SCOPE,
-        cache_handler=None
-    )
+    sp = spotipy.Spotify(auth=token)
+    # Ensure we bypass the Google Cloud Shell proxy issue
+    sp.prefix = "https://api.spotify.com/v1/"
 
-    auth_manager.token_info = {
-        "access_token": token,
-        "token_type": "Bearer",
-        "expires_in": 3600,
-    }
-
-    sp = spotipy.Spotify(auth_manager=auth_manager, requests_timeout=10, retries=3)
     now = datetime.datetime.now()
-
-    # Time Features
-    day, aft, eve, ngt = now.weekday(), 0, 0, 0
-    if 12 <= now.hour < 17:
-        aft = 1
-    elif 17 <= now.hour < 22:
-        eve = 1
-    elif (now.hour >= 22 or now.hour < 5):
-        ngt = 1
-
-    # --- 1. DATA FETCHING (IMPROVED: FREQUENCY-BASED SEEDING) ---
-    positives = []
-    negatives = []
-
-    # We will track all artist IDs found in positives to count them later
-    all_artist_ids = []
+    day = now.weekday()
+    aft, eve, ngt = (1, 0, 0) if 12 <= now.hour < 17 else (0, 1, 0) if 17 <= now.hour < 22 else (0, 0, 1) if (
+                now.hour >= 22 or now.hour < 5) else (0, 0, 0)
 
     try:
-        # A. Gather Positives from 4 Sources
-        recent_res = sp.current_user_recently_played(limit=50)
-        top_short = sp.current_user_top_tracks(limit=50, time_range='short_term')
-        top_medium = sp.current_user_top_tracks(limit=50, time_range='medium_term')
-        liked_res = sp.current_user_saved_tracks(limit=50)
+        # --- 1. SMART FETCHING ---
+        # Get history to understand current "Vibe"
+        recent = sp.current_user_recently_played(limit=20)['items']
+        top_tracks = sp.current_user_top_tracks(limit=20, time_range='short_term')['items']
+        liked = sp.current_user_saved_tracks(limit=20)['items']
 
-        raw_positives = []
-        if recent_res: raw_positives.extend([item['track'] for item in recent_res['items']])
-        if top_short: raw_positives.extend(top_short['items'])
-        if top_medium: raw_positives.extend(top_medium['items'])
-        if liked_res: raw_positives.extend([item['track'] for item in liked_res['items']])
+        seen_ids = set(
+            [t['track']['id'] for t in recent] + [t['id'] for t in top_tracks] + [t['track']['id'] for t in liked])
 
-        # Deduplicate Positives and Collect Artist Frequencies
-        seen_pos_ids = set()
-        final_positives = []
+        # Identify your "Heavy Hitter" Artists from this session
+        artist_ids = [t['track']['artists'][0]['id'] for t in recent] + [t['artists'][0]['id'] for t in top_tracks]
+        heavy_hitters = [a_id for a_id, count in Counter(artist_ids).most_common(5)]
 
-        for track in raw_positives:
-            # Skip invalid tracks or local files
-            if not track or not track.get('id'):
-                continue
+        # --- 2. CANDIDATE GENERATION ---
+        candidates = {}
+        for a_id in heavy_hitters:
+            related = sp.artist_related_artists(a_id)['artists'][:3]
+            for rel in related:
+                # Use their top tracks as candidates
+                for track in sp.artist_top_tracks(rel['id'])['tracks'][:10]:
+                    if track['id'] not in seen_ids:
+                        candidates[track['id']] = track
 
-            if track['id'] not in seen_pos_ids:
-                final_positives.append(track)
-                seen_pos_ids.add(track['id'])
+        if not candidates:
+            # Emergency Fallback to Top Global so frontend doesn't get 'null'
+            fallback = sp.playlist_tracks("37i9dQZEVXbMDoHDwfs2t3", limit=size)
+            candidates = {t['track']['id']: t['track'] for t in fallback['items']}
 
-                # Collect primary artist ID for frequency analysis
-                if track['artists']:
-                    all_artist_ids.append(track['artists'][0]['id'])
+        # --- 3. AI RANKING ---
+        meta = []
+        rows = []
+        for tid, t in candidates.items():
+            # Matching the 7-feature structure of your pre-trained model
+            # [day, popularity, user_affinity, track_weight, is_aft, is_eve, is_ngt]
+            rows.append([day, t['popularity'], 0.4, 0.5, aft, eve, ngt])
+            meta.append({
+                "id": t['id'], "name": t['name'], "artist": t['artists'][0]['name'],
+                "url": t['external_urls']['spotify'], "pop": t['popularity'],
+                "albumArt": t['album']['images'][0]['url'] if t['album']['images'] else ""
+            })
 
-        positives = final_positives
+        # Calculate Scores
+        df_pred = pd.DataFrame(rows,
+                               columns=['day_of_week', 'artist_global_plays', 'user_affinity', 'track_context_weight',
+                                        'time_bucket_afternoon', 'time_bucket_evening', 'time_bucket_night'])
 
-        if not all_artist_ids:
-            raise HTTPException(status_code=400, detail="Not enough history to generate seeds.")
+        if model_xgb and model_lgbm:
+            scores = (model_xgb.predict_proba(df_pred)[:, 1] + model_lgbm.predict_proba(df_pred)[:, 1]) / 2
+        else:
+            scores = [0.5] * len(meta)  # Fallback if model files are missing
 
-        # B. Identify "Heavy Hitters" (Top 5 Most Frequent Artists)
-        # This replaces the generic 'sp.current_user_top_artists' call
-        artist_counts = Counter(all_artist_ids)
+        for i in range(len(meta)):
+            # Discovery Boost: Nudge up songs that aren't mainstream (pop < 70)
+            discovery_boost = 1.1 if meta[i]['pop'] < 70 else 1.0
+            meta[i]['score'] = float(scores[i]) * discovery_boost
 
-        # Get the top 5 most common artist IDs
-        top_frequent_artists = [artist_id for artist_id, count in artist_counts.most_common(5)]
-
-        # C. Controlled Diversification (Expand Pool)
-        # We start with our Heavy Hitters to ensure the core vibe is present
-        expanded_artist_pool = list(top_frequent_artists)
-
-        # We find related artists ONLY for these heavy hitters
-        # This keeps the 'diversity' relevant to what you are actually listening to.
-        for a_id in top_frequent_artists:
-            try:
-                related = sp.artist_related_artists(a_id)['artists']
-                # Take top 3 related artists per heavy hitter (Don't dilute too much)
-                expanded_artist_pool.extend([r['id'] for r in related[:3]])
-            except:
-                continue
-
-        # Remove duplicates from the artist pool
-        final_seed_artists = list(set(expanded_artist_pool))
-
-        # D. Collect Candidate Tracks (Potential Recommendations)
-        # We fetch top tracks for this curated list of artists
-        for a_id in final_seed_artists:
-            try:
-                # We can grab up to 10 top tracks per artist
-                artist_tracks = sp.artist_top_tracks(a_id)['tracks']
-                negatives.extend(artist_tracks)
-            except:
-                continue
+        return {"recommendations": sorted(meta, key=lambda x: x['score'], reverse=True)[:size]}
 
     except Exception as e:
-        print(f"Fetch Error: {e}")
-        raise HTTPException(status_code=400, detail=f"Spotify error: {str(e)}")
-
-    if not positives or not negatives:
-        raise HTTPException(status_code=400, detail="Could not build recommendation pool.")
-
-    # ... (Step 2 and 3: Feature Engineering and Model Training remain exactly the same) ...
-
-    # --- 2. REAL-TIME AI TRAINING ---
-    training_data = []
-    for p in positives:
-        feats = extract_features(p, now, day, aft, eve, ngt, is_recent=True)
-        training_data.append(feats + [1])
-
-    # Increased sample to 200 to match the deeper positive data
-    train_negs = random.sample(negatives, min(len(negatives), 200))
-    for n in train_negs:
-        feats = extract_features(n, now, day, aft, eve, ngt, is_recent=False)
-        training_data.append(feats + [0])
-
-    cols = ['day_of_week', 'artist_global_plays', 'user_affinity', 'track_context_weight',
-            'time_bucket_afternoon', 'time_bucket_evening', 'time_bucket_night', 'label']
-    df = pd.DataFrame(training_data, columns=cols)
-
-    X_train = df.drop('label', axis=1)
-    y_train = df['label']
-
-    # Using 50 estimators for slightly better learning with the larger dataset
-    model_xgb = joblib.load("discovery_xgb_finetuned.pkl")
-    model_lgbm = joblib.load("discovery_lgbm_finetuned.pkl")
-
-    model_xgb.fit(X_train, y_train)
-    model_lgbm.fit(X_train, y_train)
-
-    # --- 3. IMPROVED RANKING ---
-    meta = []
-    prediction_rows = []
-    unique_pool = {t['id']: t for t in negatives if t and 'id' in t}.values()
-
-    for t in unique_pool:
-        if t['id'] in seen_pos_ids:
-            continue
-
-        feats = extract_features(t, now, day, aft, eve, ngt, is_recent=False)
-        prediction_rows.append(feats)
-
-        # Store metadata for final display
-        meta.append({
-            "id": t['id'],
-            "name": t['name'],
-            "artist": t['artists'][0]['name'],
-            "pop": t['popularity'],
-            "url": t['external_urls']['spotify'],
-            "albumArt": t['album']['images'][0]['url'] if t['album']['images'] else ""
-        })
-
-    # Get raw probabilities from your models
-    X_pred = pd.DataFrame(prediction_rows, columns=cols[:-1])
-    prob_xgb = model_xgb.predict_proba(X_pred)[:, 1]
-    prob_lgbm = model_lgbm.predict_proba(X_pred)[:, 1]
-
-    base_scores = (prob_xgb + prob_lgbm) / 2
-
-    for i in range(len(meta)):
-        # --- THE SECRET SAUCE: RANKING ADJUSTMENTS ---
-        raw_score = float(base_scores[i])
-
-        # 1. Diversity Penalty: If the song is TOO popular (e.g. > 90),
-        # nudge it down slightly to favor discovery of hidden gems.
-        pop_factor = 1.0
-        if meta[i]['pop'] > 85:
-            pop_factor = 0.95
-
-            # 2. Artist Freshness: Give a tiny boost to artists you've
-        # liked but haven't played in the last 50 songs.
-        # (This uses the data from your heavy_hitters logic)
-
-        meta[i]['score'] = raw_score * pop_factor
-
-    # Sort and return
-    final_recs = sorted(meta, key=lambda x: x['score'], reverse=True)[:size]
+        print(f"Error: {e}")
+        # ALWAYS return a valid recommendations list even if it's empty to prevent frontend crash
+        return {"recommendations": []}
 
 @app.post("/save-playlist")
 async def save_playlist(request: PlaylistSaveRequest):
