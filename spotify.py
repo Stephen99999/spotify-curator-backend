@@ -278,7 +278,7 @@ async def recommend(token: str, size: int = Query(50, ge=30, le=50)):
                 # Get related artists
                 related = sp.artist_related_artists(artist_id)['artists']
 
-                for rel_artist in related[:10]:  # Top 5 related per seed
+                for rel_artist in related[:5]:  # Top 5 related per seed
                     rel_id = rel_artist['id']
                     if rel_id not in related_artist_cache:
                         related_artist_cache.add(rel_id)
@@ -349,6 +349,46 @@ async def recommend(token: str, size: int = Query(50, ge=30, le=50)):
             "artist_plays": artist_play_count
         })
 
+    # If no new tracks after filtering, allow re-recommendations of existing tracks
+    if not prediction_rows:
+        print("   ⚠️  No new tracks found. Including previously heard tracks...")
+
+        for track in candidate_pool:
+            if not track or not track.get('id'):
+                continue
+
+            track_id = track['id']
+            artist_id = track['artists'][0]['id'] if track['artists'] else None
+
+            if not artist_id:
+                continue
+
+            # Now we DON'T skip tracks user has heard
+            artist_play_count = artist_play_counts.get(artist_id, 0)
+            track_buckets = track_time_buckets.get(track_id, None)
+
+            features = extract_features(
+                artist_id=artist_id,
+                day=day,
+                current_time_bucket=current_time_bucket,
+                artist_play_count=artist_play_count,
+                user_time_buckets=user_time_bucket_history,
+                track_time_buckets=track_buckets
+            )
+
+            prediction_rows.append(features)
+            meta.append({
+                "id": track['id'],
+                "name": track['name'],
+                "artist": track['artists'][0]['name'],
+                "pop": track.get('popularity', 0),
+                "url": track['external_urls']['spotify'],
+                "albumArt": track['album']['images'][0]['url'] if track['album']['images'] else "",
+                "artist_plays": artist_play_count
+            })
+
+        if not prediction_rows:
+            raise HTTPException(status_code=400, detail="No tracks available to recommend. Try again later.")
 
     # Create DataFrame with exact column names
     feature_cols = [
