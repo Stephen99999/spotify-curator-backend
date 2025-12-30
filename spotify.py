@@ -101,44 +101,53 @@ def callback(code: str):
 
 @app.get("/recommend")
 async def recommend(token: str, size: int = Query(50, ge=10, le=100)):
+    # Initialize Spotify with the token directly
     sp = spotipy.Spotify(auth=token)
 
     try:
-        # 1. Fetch more top artists to have a wider search net
-        user_top = sp.current_user_top_artists(limit=20, time_range='medium_term')['items']
-        if not user_top:
-            raise HTTPException(status_code=400, detail="Not enough user data to generate seeds.")
+        # 1. Fetch Top Artists
+        user_top = sp.current_user_top_artists(limit=10, time_range='medium_term')['items']
+
+        if not user_top or len(user_top) == 0:
+            # Fallback if user is new: use a generic seed artist or genre
+            # For now, let's throw an error to see if this is the issue
+            raise HTTPException(status_code=400, detail="No top artists found for this user.")
 
         top_artist_names = [a['name'] for a in user_top]
+        # Ensure we only have valid, non-empty IDs
+        all_seed_ids = [a['id'] for a in user_top if a.get('id')]
 
-        # 2. INCREASE THE POOL SAFELY
+        # 2. BATCHING: Spotify allows MAX 5 seeds per request
+        # We will do two batches of 5 to get a wide variety
         candidate_pool = {}
 
-        # We take the top 10 artists and fetch in 2 batches of 5 seeds each
-        # Spotify allows max 5 seeds per request.
-        seed_groups = [user_top[i:i + 5] for i in range(0, 10, 5)]
+        # Split seeds into chunks of 5
+        seed_chunks = [all_seed_ids[i:i + 5] for i in range(0, len(all_seed_ids), 5)]
 
-        for group in seed_groups:
-            group_ids = [artist['id'] for artist in group]
+        for chunk in seed_chunks:
+            try:
+                # CRITICAL: Pass the list 'chunk' directly.
+                # Do NOT convert it to a string yourself.
+                recs = sp.recommendations(seed_artists=chunk, limit=50)
 
-            # Use 50 as the limit (safe for all Spotify versions)
-            # Ensure seed_artists is a LIST, not a string
-            raw_recs = sp.recommendations(seed_artists=group_ids, limit=50)
+                for track in recs['tracks']:
+                    if track['id'] not in candidate_pool:
+                        candidate_pool[track['id']] = track
+            except Exception as e:
+                print(f"Batch failed for seeds {chunk}: {e}")
+                continue  # Skip a bad batch and keep going
 
-            for track in raw_recs['tracks']:
-                # Deduplicate by track ID
-                candidate_pool[track['id']] = track
+        if not candidate_pool:
+            raise HTTPException(status_code=404, detail="Spotify returned no recommendations for these seeds.")
 
-        # 3. RANKING LOGIC (The AI part)
+        # 3. AI RANKING
         now = datetime.datetime.now()
         feature_rows = []
         meta = []
 
-        for track_id, track in candidate_pool.items():
-            # Extract features for each candidate
+        for tid, track in candidate_pool.items():
             feats = extract_features_dynamic(track, now, top_artist_names)
             feature_rows.append(feats)
-
             meta.append({
                 "id": track['id'],
                 "name": track['name'],
@@ -147,30 +156,23 @@ async def recommend(token: str, size: int = Query(50, ge=10, le=100)):
                 "albumArt": track['album']['images'][0]['url'] if track['album']['images'] else ""
             })
 
-        if not feature_rows:
-            return {"recommendations": []}
-
-        # 4. CONVERT TO DATAFRAME FOR PREDICTION
+        # 4. PREDICTION
         cols = ['day_of_week', 'artist_global_plays', 'user_affinity', 'track_context_weight',
                 'time_bucket_afternoon', 'time_bucket_evening', 'time_bucket_night']
         X_pred = pd.DataFrame(feature_rows, columns=cols)
 
-        # Predict using your fine-tuned ensemble
-        p_xgb = model_xgb.predict_proba(X_pred)[:, 1]
-        p_lgbm = model_lgbm.predict_proba(X_pred)[:, 1]
-        scores = (p_xgb + p_lgbm) / 2
+        # Soft ensemble (XGB + LGBM)
+        scores = (model_xgb.predict_proba(X_pred)[:, 1] + model_lgbm.predict_proba(X_pred)[:, 1]) / 2
 
         for i in range(len(meta)):
             meta[i]['score'] = float(scores[i])
 
-        # Sort by score and return the requested 'size'
-        final_list = sorted(meta, key=lambda x: x['score'], reverse=True)[:size]
-
-        return {"recommendations": final_list}
+        # Return best songs based on AI ranking
+        return {"recommendations": sorted(meta, key=lambda x: x['score'], reverse=True)[:size]}
 
     except Exception as e:
         print(f"Detailed Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Recommendation Engine Error: {str(e)}")
 
 
 @app.post("/save-playlist")
