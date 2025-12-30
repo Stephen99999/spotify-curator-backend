@@ -101,53 +101,69 @@ def callback(code: str):
 
 @app.get("/recommend")
 async def recommend(token: str, size: int = Query(50, ge=10, le=100)):
-    # Initialize Spotify with the token directly
     sp = spotipy.Spotify(auth=token)
+    now = datetime.datetime.now()
 
     try:
-        # 1. Fetch Top Artists
-        user_top = sp.current_user_top_artists(limit=10, time_range='medium_term')['items']
+        # --- 1. GATHER CONTEXT (Recently Played, Top Artists, Liked Songs) ---
+        # Fetching Top Artists
+        top_res = sp.current_user_top_artists(limit=10, time_range='medium_term')['items']
+        # Fetching Recently Played
+        recent_res = sp.current_user_recently_played(limit=20)['items']
+        # Fetching Liked Songs
+        liked_res = sp.current_user_saved_tracks(limit=20)['items']
 
-        if not user_top or len(user_top) == 0:
-            # Fallback if user is new: use a generic seed artist or genre
-            # For now, let's throw an error to see if this is the issue
-            raise HTTPException(status_code=400, detail="No top artists found for this user.")
+        # Collect all artist names the user currently likes/listens to
+        # This is used to calculate the 'user_affinity' feature
+        top_artist_names = set([a['name'] for a in top_res])
+        for item in recent_res: top_artist_names.add(item['track']['artists'][0]['name'])
+        for item in liked_res: top_artist_names.add(item['track']['artists'][0]['name'])
 
-        top_artist_names = [a['name'] for a in user_top]
-        # Ensure we only have valid, non-empty IDs
-        all_seed_ids = [a['id'] for a in user_top if a.get('id')]
+        # --- 2. BUILD THE CANDIDATE POOL ---
+        candidates = {}
 
-        # 2. BATCHING: Spotify allows MAX 5 seeds per request
-        # We will do two batches of 5 to get a wide variety
-        candidate_pool = {}
+        # Combine different sources for variety
+        # Source A: Related to Top Artists
+        seed_artists = top_res[:5]
 
-        # Split seeds into chunks of 5
-        seed_chunks = [all_seed_ids[i:i + 5] for i in range(0, len(all_seed_ids), 5)]
+        # Source B: Related to Recently Played Artists
+        for item in recent_res[:5]:
+            seed_artists.append(item['track']['artists'][0])
 
-        for chunk in seed_chunks:
+        # Source C: Related to Artists from Liked Songs
+        for item in liked_res[:5]:
+            seed_artists.append(item['track']['artists'][0])
+
+        # Deduplicate seeds and fetch related artist top tracks
+        seen_seeds = set()
+        for artist in seed_artists:
+            a_id = artist['id']
+            if a_id in seen_seeds: continue
+            seen_seeds.add(a_id)
+
             try:
-                # CRITICAL: Pass the list 'chunk' directly.
-                # Do NOT convert it to a string yourself.
-                recs = sp.recommendations(seed_artists=chunk, limit=50)
+                related = sp.artist_related_artists(a_id)['artists'][:3]  # Top 3 related
+                for rel_artist in related:
+                    rel_tracks = sp.artist_top_tracks(rel_artist['id'])['tracks'][:5]  # 5 songs each
+                    for track in rel_tracks:
+                        # Don't recommend songs the user already has in their 'Recently Played'
+                        candidates[track['id']] = track
+            except:
+                continue
 
-                for track in recs['tracks']:
-                    if track['id'] not in candidate_pool:
-                        candidate_pool[track['id']] = track
-            except Exception as e:
-                print(f"Batch failed for seeds {chunk}: {e}")
-                continue  # Skip a bad batch and keep going
+        if not candidates:
+            raise HTTPException(status_code=404, detail="Could not build recommendation pool.")
 
-        if not candidate_pool:
-            raise HTTPException(status_code=404, detail="Spotify returned no recommendations for these seeds.")
-
-        # 3. AI RANKING
-        now = datetime.datetime.now()
+        # --- 3. AI RANKING ---
         feature_rows = []
         meta = []
+        candidate_list = list(candidates.values())
 
-        for tid, track in candidate_pool.items():
-            feats = extract_features_dynamic(track, now, top_artist_names)
+        for track in candidate_list:
+            # Check if this artist is one of the user's favorites
+            feats = extract_features_dynamic(track, now, list(top_artist_names))
             feature_rows.append(feats)
+
             meta.append({
                 "id": track['id'],
                 "name": track['name'],
@@ -156,23 +172,21 @@ async def recommend(token: str, size: int = Query(50, ge=10, le=100)):
                 "albumArt": track['album']['images'][0]['url'] if track['album']['images'] else ""
             })
 
-        # 4. PREDICTION
+        # Predict
         cols = ['day_of_week', 'artist_global_plays', 'user_affinity', 'track_context_weight',
                 'time_bucket_afternoon', 'time_bucket_evening', 'time_bucket_night']
         X_pred = pd.DataFrame(feature_rows, columns=cols)
 
-        # Soft ensemble (XGB + LGBM)
         scores = (model_xgb.predict_proba(X_pred)[:, 1] + model_lgbm.predict_proba(X_pred)[:, 1]) / 2
 
         for i in range(len(meta)):
             meta[i]['score'] = float(scores[i])
 
-        # Return best songs based on AI ranking
         return {"recommendations": sorted(meta, key=lambda x: x['score'], reverse=True)[:size]}
 
     except Exception as e:
-        print(f"Detailed Error: {e}")
-        raise HTTPException(status_code=500, detail=f"Recommendation Engine Error: {str(e)}")
+        print(f"Fetch Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/save-playlist")
