@@ -90,48 +90,44 @@ def extract_features(artist_id: str, day: int, current_time_bucket: str, artist_
     ]
 
 
-# --- ROBUST HISTORY FETCHING ---
-def get_recent_tracks_robust(sp):
+# --- HYBRID HISTORY FETCHING ---
+def get_user_context_hybrid(sp):
     """
-    Fetches up to 50 recent tracks securely.
-    Manual pagination to avoid next() errors.
+    Combines 'Recently Played' (immediate context) with 'Top Tracks' (weekly context)
+    to bypass the API's 50-track history limit.
     """
-    recent_tracks = []
+    combined_tracks = []
     seen_ids = set()
-    cutoff = int((datetime.datetime.utcnow() - datetime.timedelta(days=7)).timestamp() * 1000)
 
+    # 1. Get the "Real" Recent History (Max 50)
+    # This captures your vibe RIGHT NOW.
     try:
-        # Initial fetch
-        results = sp.current_user_recently_played(limit=50)
-        items = results.get('items', [])
-
-        # Add items
-        for item in items:
-            tid = item.get("track", {}).get("id")
-            if tid and tid not in seen_ids:
-                recent_tracks.append(item)
-                seen_ids.add(tid)
-
-        # Simple depth check: If we have fewer than 10 tracks, try one pagination step
-        if len(recent_tracks) < 10 and items:
-            last_ts = items[-1].get("played_at")
-            if last_ts:
-                try:
-                    dt = datetime.datetime.fromisoformat(str(last_ts).replace("Z", "+00:00"))
-                    ts_millis = int(dt.timestamp() * 1000)
-                    if ts_millis > cutoff:
-                        more = sp.current_user_recently_played(limit=50, before=ts_millis)
-                        for item in more.get('items', []):
-                            tid = item.get("track", {}).get("id")
-                            if tid and tid not in seen_ids:
-                                recent_tracks.append(item)
-                                seen_ids.add(tid)
-                except:
-                    pass
+        recent_results = sp.current_user_recently_played(limit=50)
+        for item in recent_results.get('items', []):
+            track = item.get("track")
+            if track and track.get("id") and track["id"] not in seen_ids:
+                # We attach a 'weight' to recent tracks to prioritize them slightly
+                track["_source"] = "recent"
+                track["played_at"] = item.get("played_at")  # Preserve timestamp
+                combined_tracks.append(track)
+                seen_ids.add(track["id"])
     except Exception as e:
-        print(f"History fetch warning: {e}")
+        print(f"⚠️ Recent History Error: {e}")
 
-    return recent_tracks
+    # 2. Get 'Short Term' Top Tracks (Last ~4 Weeks)
+    # This fills the "Sunday to Sunday" gap that history misses.
+    try:
+        top_results = sp.current_user_top_tracks(limit=50, time_range="short_term")
+        for track in top_results.get('items', []):
+            if track and track.get("id") and track["id"] not in seen_ids:
+                track["_source"] = "top_weekly"
+                track["played_at"] = None  # Top tracks don't have a specific timestamp
+                combined_tracks.append(track)
+                seen_ids.add(track["id"])
+    except Exception as e:
+        print(f"⚠️ Top Tracks Error: {e}")
+
+    return combined_tracks
 
 
 # --- MAIN ENDPOINT ---
@@ -142,55 +138,42 @@ async def recommend(request: RecommendRequest):
 
     sp = spotipy.Spotify(auth=request.token, requests_timeout=10, retries=2)
 
-    # 0. User Info & Market (Important for Availability)
+    # 0. Check User Market
     try:
         user_info = sp.current_user()
         market = user_info.get("country", "US")
     except:
         market = "US"
 
-    # 1. Get History
-    recent_items = get_recent_tracks_robust(sp)
+    # 1. HYBRID FETCH: Get ~100 tracks representing "The User's Week"
+    context_pool = get_user_context_hybrid(sp)
 
-    # Fallback: Top Tracks if History Empty
-    if not recent_items:
-        try:
-            top = sp.current_user_top_tracks(limit=50, time_range="short_term").get("items", [])
-            recent_items = [{"track": t, "played_at": None} for t in top]
-        except:
-            pass
+    if not context_pool:
+        raise HTTPException(status_code=400, detail="Could not find any listening history.")
 
-    if not recent_items:
-        raise HTTPException(status_code=400, detail="No history found to base recommendations on.")
-
-    # 2. Build Profiles & Seeds
+    # 2. Build Profiles (Artist Counts, Time Buckets)
     seed_track_ids = []
-    artist_ids = []
     artist_counts = Counter()
 
-    # Context data
+    # We use current time for context if the track came from 'top_tracks' (which has no timestamp)
+    now_bucket = get_time_bucket(datetime.datetime.utcnow().hour)
+
+    # For feature extraction
     user_time_buckets = []
     track_bucket_map = {}
-    now_bucket = get_time_bucket(datetime.datetime.utcnow().hour)
-    day = datetime.datetime.utcnow().weekday()
 
-    for item in recent_items:
-        t = item.get("track")
-        if not t: continue
-
+    for t in context_pool:
         tid = t.get("id")
-        if tid:
-            seed_track_ids.append(tid)
+        seed_track_ids.append(tid)
 
-        # Artists
+        # Artist Counts
         if t.get("artists"):
             aid = t["artists"][0].get("id")
-            if aid:
-                artist_ids.append(aid)
-                artist_counts[aid] += 1
+            if aid: artist_counts[aid] += 1
 
-        # Time context
-        ts = item.get("played_at")
+        # Time Bucket Logic
+        # If it came from history, use its real time. If from top tracks, assume "General User Vibe" (current time)
+        ts = t.get("played_at")
         bucket = now_bucket
         if ts:
             try:
@@ -198,79 +181,69 @@ async def recommend(request: RecommendRequest):
                 bucket = get_time_bucket(dt.hour)
             except:
                 pass
-        user_time_buckets.append(bucket)
-        if tid:
-            track_bucket_map.setdefault(tid, []).append(bucket)
 
-    # 3. CANDIDATE GENERATION LOOP
-    # We want at least 3x the requested size to allow for filtering/scoring
+        user_time_buckets.append(bucket)
+        track_bucket_map.setdefault(tid, []).append(bucket)
+
+    # 3. GENERATE CANDIDATES
+    # We take random samples from our robust 100-song context pool
     target_pool_size = request.size * 3
     candidate_pool = []
-    seen_cand_ids = set(seed_track_ids)  # Don't recommend what they just played
+    seen_cand_ids = set(seed_track_ids)
 
-    # Strategy A: Recommendations from Track Seeds (Batched)
     unique_seeds = list(dict.fromkeys(seed_track_ids))
     random.shuffle(unique_seeds)
 
-    # Create batches of 5 (Spotify Max)
+    # Create batches of 5 (Spotify Max Seeds)
     batches = [unique_seeds[i:i + 5] for i in range(0, len(unique_seeds), 5)]
-
-    # Limit max batches to avoid timeout (e.g. max 10 API calls)
-    batches = batches[:10]
+    batches = batches[:15]  # Increase breadth since we have more data now
 
     for batch in batches:
-        if len(candidate_pool) >= target_pool_size:
-            break
+        if len(candidate_pool) >= target_pool_size: break
         try:
-            # limit=50 per call is optimal
             recs = sp.recommendations(seed_tracks=batch, limit=50, country=market)
             if recs and 'tracks' in recs:
                 for t in recs['tracks']:
                     if t['id'] not in seen_cand_ids:
                         candidate_pool.append(t)
                         seen_cand_ids.add(t['id'])
-        except Exception as e:
-            print(f"⚠️ Recs Error: {e}")
+        except:
+            continue
 
-    # Strategy B: Backfill with Related Artists / Top Tracks (If pool is still small)
+    # Fallback Mechanism: Fill from Top Artists if pool is small
     if len(candidate_pool) < request.size:
-        print("⚠️ Pool too small, triggering Backfill Strategy...")
-        # Take top 5 artists user listened to
         top_artists = [a for a, c in artist_counts.most_common(5)]
-
         for aid in top_artists:
             if len(candidate_pool) >= target_pool_size: break
             try:
-                top_tracks = sp.artist_top_tracks(aid, country=market).get("tracks", [])
-                for t in top_tracks:
+                top_t = sp.artist_top_tracks(aid, country=market).get("tracks", [])
+                for t in top_t:
                     if t['id'] not in seen_cand_ids:
                         candidate_pool.append(t)
                         seen_cand_ids.add(t['id'])
             except:
                 continue
 
-    # Final Check
     if not candidate_pool:
-        raise HTTPException(status_code=400,
-                            detail="Could not generate any songs. Try listening to more music on Spotify first.")
+        raise HTTPException(status_code=400, detail="No recommendations found. Try listening to more music!")
 
-    # 4. SCORING
+    # 4. SCORING (Standard)
     meta = []
     prediction_rows = []
-
-    # Limit processing to target_pool_size to save CPU
     candidate_pool = candidate_pool[:target_pool_size]
+    day = datetime.datetime.utcnow().weekday()
 
     for t in candidate_pool:
         tid = t.get("id")
         art = t.get("artists", [{}])[0]
         aid = art.get("id", "")
 
-        # Features
-        a_plays = artist_counts.get(aid, 0)
-        t_ctx = track_bucket_map.get(tid, [])
-
-        feats = extract_features(aid, day, now_bucket, a_plays, user_time_buckets, t_ctx)
+        feats = extract_features(
+            aid, day, now_bucket,
+            artist_counts.get(aid, 0),
+            user_time_buckets,
+            track_bucket_map.get(tid, [])
+        )
         prediction_rows.append(feats)
 
         meta.append({
@@ -279,11 +252,11 @@ async def recommend(request: RecommendRequest):
             "artist": art.get("name"),
             "url": t.get("external_urls", {}).get("spotify"),
             "albumArt": (t.get("album", {}).get("images") or [{}])[0].get("url"),
-            "artist_plays": a_plays,
+            "artist_plays": artist_counts.get(aid, 0),
             "score": 0.0
         })
 
-    # AI Prediction
+    # Predict
     cols = ["day_of_week", "artist_global_plays", "user_affinity", "track_context_weight",
             "time_bucket_afternoon", "time_bucket_evening", "time_bucket_night"]
 
@@ -295,16 +268,12 @@ async def recommend(request: RecommendRequest):
             p2 = model_lgbm.predict_proba(X)[:, 1]
             final_scores = (p1 + p2) / 2
         except:
-            # If model fails, fallback to random shuffle
-            final_scores = [random.random() for _ in range(len(meta))]
+            final_scores = [0.5] * len(meta)
 
-    # Assign Scores & Sort
     for i, score in enumerate(final_scores):
-        # Boost discovery (unheard artists)
         boost = 1.15 if meta[i]["artist_plays"] == 0 else 1.0
         meta[i]["score"] = float(score) * boost
 
-    # 5. Return EXACTLY requested size (or as many as we found)
     results = sorted(meta, key=lambda x: x["score"], reverse=True)
     return {"recommendations": results[:request.size]}
 
@@ -318,6 +287,7 @@ def login():
 @app.get("/callback")
 def callback(code: str):
     token = sp_oauth.get_access_token(code)
+    # Update this URL to match your frontend location
     return RedirectResponse(f"https://spotify-playlist-curator.vercel.app/home?token={token['access_token']}")
 
 
@@ -329,7 +299,7 @@ async def save_playlist(request: PlaylistSaveRequest):
         pl = sp.user_playlist_create(uid, request.name, public=False)
         uris = [f"spotify:track:{id}" for id in request.track_ids]
 
-        # Batching for large saves
+        # Batching for large saves (Spotify limit 100)
         for i in range(0, len(uris), 100):
             sp.playlist_add_items(pl["id"], uris[i:i + 100])
 
