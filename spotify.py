@@ -154,9 +154,10 @@ def is_spotify_id(s):
 
 @app.post("/recommend")
 async def recommend(request: RecommendRequest):
-    if not model_xgb:
-        raise HTTPException(status_code=500, detail="Models not active")
+    if not model_xgb or not model_lgbm:
+        raise HTTPException(status_code=500, detail="Models not loaded")
 
+    # --- Spotify Client ---
     session = requests.Session()
     session.trust_env = False
 
@@ -167,44 +168,39 @@ async def recommend(request: RecommendRequest):
         requests_session=session
     )
 
-    # --- TOKEN VALIDATION ---
+    # --- Validate Token ---
     try:
         user = sp.current_user()
         market = user.get("country", "US")
-    except SpotifyException as e:
-        raise HTTPException(
-            status_code=401,
-            detail=f"Invalid or expired Spotify token: {e}"
-        )
+    except SpotifyException:
+        raise HTTPException(status_code=401, detail="Invalid or expired Spotify token")
 
-    # --- CLEAN HISTORY ---
+    # --- Fetch Clean Listening History ---
     context_pool = get_clean_history(sp)
 
     if len(context_pool) < 5:
-        top_global = sp.playlist_tracks(
+        fallback = sp.playlist_tracks(
             "37i9dQZEVXbMDoHDwVN2tF", limit=10, market=market
         )
         context_pool = [
-            t['track'] for t in top_global['items']
-            if t.get('track') and is_valid_seed(t['track'])
+            t["track"] for t in fallback["items"]
+            if t.get("track") and is_valid_seed(t["track"])
         ]
 
     seed_track_ids = [
-        t['id'] for t in context_pool
-        if t.get('id') and is_spotify_id(t.get('id'))
+        t["id"] for t in context_pool
+        if t.get("id") and is_spotify_id(t["id"])
     ]
 
     seed_artist_ids = [
-        t['artists'][0]['id']
-        for t in context_pool
-        if t.get('artists') and t['artists'][0].get('id')
+        t["artists"][0]["id"] for t in context_pool
+        if t.get("artists") and t["artists"][0].get("id")
     ]
 
     if not seed_track_ids:
-        raise HTTPException(status_code=400, detail="No valid seed tracks found.")
+        raise HTTPException(status_code=400, detail="No valid seed tracks found")
 
-    # --- CANDIDATE GENERATION ---
-    target_pool_size = request.size * 4
+    # --- Candidate Generation ---
     candidate_pool = []
     seen_ids = set(seed_track_ids)
 
@@ -212,8 +208,6 @@ async def recommend(request: RecommendRequest):
     batches = [seed_track_ids[i:i + 5] for i in range(0, len(seed_track_ids), 5)][:8]
 
     for batch in batches:
-        if len(candidate_pool) >= target_pool_size // 2:
-            break
         try:
             recs = sp.recommendations(
                 seed_tracks=batch,
@@ -226,51 +220,47 @@ async def recommend(request: RecommendRequest):
                 if t.get("id") and t["id"] not in seen_ids and is_valid_seed(t):
                     candidate_pool.append(t)
                     seen_ids.add(t["id"])
-        except SpotifyException as e:
-            logger.error(f"Spotify rec error ({e.http_status}): {e} | seeds={batch}")
+        except SpotifyException:
             continue
 
-    # --- RELATED ARTIST HOP ---
+    # --- Related Artist Expansion ---
     random.shuffle(seed_artist_ids)
 
     for aid in seed_artist_ids[:5]:
-        if len(candidate_pool) >= target_pool_size:
-            break
         try:
             related = sp.artist_related_artists(aid)
-            rel_art = random.choice(related["artists"][:5])
-            top_tracks = sp.artist_top_tracks(rel_art["id"], market=market)
+            artist = random.choice(related["artists"][:5])
+            top_tracks = sp.artist_top_tracks(artist["id"], market=market)
 
-            for t in top_tracks.get("tracks", [])[:5]:
+            for t in top_tracks["tracks"][:5]:
                 if t.get("id") and t["id"] not in seen_ids and is_valid_seed(t):
                     candidate_pool.append(t)
                     seen_ids.add(t["id"])
-        except SpotifyException as e:
-            logger.warning(f"Related artist skip ({e.http_status}): {aid}")
+        except SpotifyException:
             continue
 
     if not candidate_pool:
-        raise HTTPException(status_code=400, detail="Spotify returned no recommendations.")
+        raise HTTPException(status_code=400, detail="No recommendations returned")
 
-    # --- AI SCORING ---
+    # --- Feature Engineering ---
     now_bucket = get_time_bucket(datetime.datetime.utcnow().hour)
     day = datetime.datetime.utcnow().weekday()
 
     artist_counts = Counter(seed_artist_ids)
-    user_time_buckets = [now_bucket]
 
-    meta = []
     rows = []
+    meta = []
 
     for t in candidate_pool:
         aid = t["artists"][0]["id"]
+
         rows.append(
             extract_features(
                 aid,
                 day,
                 now_bucket,
                 artist_counts.get(aid, 0),
-                user_time_buckets,
+                [now_bucket],
                 [now_bucket]
             )
         )
@@ -295,6 +285,7 @@ async def recommend(request: RecommendRequest):
         "time_bucket_night"
     ]).fillna(0)
 
+    # --- AI Scoring ---
     with model_lock:
         try:
             p1 = model_xgb.predict_proba(X)[:, 1]
@@ -303,7 +294,7 @@ async def recommend(request: RecommendRequest):
         except Exception:
             scores = [random.random() for _ in meta]
 
-    # --- FINAL FILTERING ---
+    # --- Final Ranking & Diversity Filter ---
     final = []
     artist_cap = Counter()
 
@@ -323,6 +314,7 @@ async def recommend(request: RecommendRequest):
             break
 
     return {"recommendations": final}
+
 
 
 
