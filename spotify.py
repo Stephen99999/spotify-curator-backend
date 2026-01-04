@@ -155,8 +155,8 @@ def is_spotify_id(s):
 @app.post("/recommend")
 async def recommend(request: RecommendRequest):
     """
-    Alternative recommendation system using search and user's listening history
-    since Spotify deprecated /recommendations endpoint in Nov 2024
+    Recommendation system using ONLY non-deprecated Spotify API endpoints.
+    No /recommendations, /audio-features, or /related-artists used.
     """
     if not model_xgb:
         raise HTTPException(status_code=500, detail="Models not active")
@@ -175,32 +175,32 @@ async def recommend(request: RecommendRequest):
     try:
         user = sp.current_user()
         market = user.get("country", "US")
-        logger.info(f"User market: {market}")
+        logger.info(f"✓ User authenticated. Market: {market}")
     except SpotifyException as e:
-        raise HTTPException(
-            status_code=401,
-            detail=f"Invalid or expired Spotify token: {e}"
-        )
+        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
     # --- GET USER'S LISTENING CONTEXT ---
     context_pool = get_clean_history(sp)
 
     if len(context_pool) < 5:
-        # Fallback to top tracks
+        logger.info("Limited history, fetching top tracks...")
         try:
             top_tracks = sp.current_user_top_tracks(limit=50, time_range='short_term')
-            context_pool = [
+            context_pool.extend([
                 track for track in top_tracks.get('items', [])
-                if track.get('id') and is_valid_seed(track)
-            ]
+                if track.get('id') and is_valid_seed(track) and
+                   track['id'] not in [t['id'] for t in context_pool]
+            ])
         except:
             pass
 
     if not context_pool:
         raise HTTPException(
             status_code=400,
-            detail="Unable to access your listening history. Please ensure you've listened to some tracks on Spotify."
+            detail="No listening history found. Please listen to some music on Spotify first."
         )
+
+    logger.info(f"Context pool size: {len(context_pool)} tracks")
 
     # --- EXTRACT ARTISTS AND GENRES ---
     seed_artist_ids = []
@@ -210,131 +210,153 @@ async def recommend(request: RecommendRequest):
     for track in context_pool:
         if track.get('artists'):
             for artist in track['artists']:
-                if artist.get('id'):
+                if artist.get('id') and artist.get('name'):
                     seed_artist_ids.append(artist['id'])
-                    artist_names.append(artist.get('name', ''))
+                    artist_names.append(artist['name'])
 
     # Get artist details for genres
-    unique_artist_ids = list(set(seed_artist_ids[:50]))
+    unique_artist_ids = list(set(seed_artist_ids))
     random.shuffle(unique_artist_ids)
 
+    logger.info(f"Fetching genre data from {min(20, len(unique_artist_ids))} artists...")
     for aid in unique_artist_ids[:20]:
         try:
             artist_info = sp.artist(aid)
-            all_genres.extend(artist_info.get('genres', []))
-        except:
+            genres = artist_info.get('genres', [])
+            all_genres.extend(genres)
+            logger.info(f"  Artist genres: {genres[:3] if genres else 'none'}")
+        except Exception as e:
+            logger.warning(f"  Failed to get artist {aid}: {e}")
             continue
 
-    # --- BUILD CANDIDATE POOL USING SEARCH ---
+    if not all_genres:
+        logger.warning("No genres found, will rely more on artist search")
+
+    # --- BUILD CANDIDATE POOL ---
     target_pool_size = request.size * 4
     candidate_pool = []
     seen_ids = set([t['id'] for t in context_pool])
 
-    # Strategy 1: Search by artist combinations
+    logger.info(f"Building candidate pool (target: {target_pool_size})...")
+
+    # STRATEGY 1: Search by similar artists (60% of pool)
     random.shuffle(artist_names)
-    search_artists = [a for a in artist_names if a][:15]
+    search_artists = [a for a in artist_names if a][:20]
 
     for i in range(0, len(search_artists), 2):
-        if len(candidate_pool) >= target_pool_size // 3:
+        if len(candidate_pool) >= target_pool_size * 0.6:
             break
 
-        # Combine 2 artists for search
         query_artists = search_artists[i:i + 2]
-        query = ' OR '.join([f'artist:{a}' for a in query_artists])
+        query = ' OR '.join(query_artists)
 
         try:
-            results = sp.search(
-                q=query,
-                type='track',
-                limit=50,
-                market=market
-            )
+            results = sp.search(q=query, type='track', limit=50, market=market)
 
             for item in results.get('tracks', {}).get('items', []):
-                if (item.get('id') and
-                        item['id'] not in seen_ids and
-                        is_valid_seed(item)):
+                if not item.get('id') or item['id'] in seen_ids or not is_valid_seed(item):
+                    continue
 
-                    # Filter out tracks from same artists (we want discovery)
-                    item_artists = [a.get('name', '') for a in item.get('artists', [])]
-                    if not any(a in search_artists[:5] for a in item_artists):
-                        candidate_pool.append(item)
-                        seen_ids.add(item['id'])
-        except:
-            continue
-
-    # Strategy 2: Search by genre combinations
-    genre_counts = Counter(all_genres)
-    top_genres = [g for g, _ in genre_counts.most_common(10)]
-
-    for i in range(0, len(top_genres), 2):
-        if len(candidate_pool) >= target_pool_size * 2 // 3:
-            break
-
-        genre_pair = top_genres[i:i + 2]
-        query = ' '.join(genre_pair)
-
-        try:
-            results = sp.search(
-                q=f'genre:"{query}"',
-                type='track',
-                limit=50,
-                market=market
-            )
-
-            for item in results.get('tracks', {}).get('items', []):
-                if (item.get('id') and
-                        item['id'] not in seen_ids and
-                        is_valid_seed(item)):
+                # Filter: prefer tracks NOT from top 5 artists (for discovery)
+                item_artists = [a.get('name', '') for a in item.get('artists', [])]
+                if not any(a in search_artists[:5] for a in item_artists):
                     candidate_pool.append(item)
                     seen_ids.add(item['id'])
-        except:
+
+        except Exception as e:
+            logger.warning(f"Search failed for artists {query_artists}: {e}")
             continue
 
-    # Strategy 3: Get tracks from top artists' albums
-    for aid in unique_artist_ids[:10]:
-        if len(candidate_pool) >= target_pool_size:
-            break
+    logger.info(f"  After artist search: {len(candidate_pool)} candidates")
 
-        try:
-            # Get artist's albums
-            albums = sp.artist_albums(aid, limit=5, album_type='album,single')
+    # STRATEGY 2: Genre-based search (if we have genres)
+    if all_genres:
+        genre_counts = Counter(all_genres)
+        top_genres = [g for g, _ in genre_counts.most_common(8)]
 
-            for album in albums.get('items', [])[:3]:
-                album_tracks = sp.album_tracks(album['id'], limit=10, market=market)
+        for genre in top_genres:
+            if len(candidate_pool) >= target_pool_size * 0.8:
+                break
 
-                for item in album_tracks.get('items', []):
+            try:
+                # Search with genre tag
+                results = sp.search(
+                    q=f'genre:"{genre}"',
+                    type='track',
+                    limit=30,
+                    market=market
+                )
+
+                for item in results.get('tracks', {}).get('items', []):
                     if (item.get('id') and
                             item['id'] not in seen_ids and
                             is_valid_seed(item)):
                         candidate_pool.append(item)
                         seen_ids.add(item['id'])
 
+            except Exception as e:
+                logger.warning(f"Genre search failed for '{genre}': {e}")
+                continue
+
+        logger.info(f"  After genre search: {len(candidate_pool)} candidates")
+
+    # STRATEGY 3: Deep dive into artists' albums
+    for aid in unique_artist_ids[:15]:
+        if len(candidate_pool) >= target_pool_size:
+            break
+
+        try:
+            albums = sp.artist_albums(
+                aid,
+                limit=5,
+                album_type='album,single',
+                market=market
+            )
+
+            for album in albums.get('items', [])[:3]:
+                album_tracks = sp.album_tracks(album['id'], limit=10, market=market)
+
+                for item in album_tracks.get('items', []):
+                    if (item.get('id') and
+                            item['id'] not in seen_ids):
+                        # Need to check if valid (album_tracks returns simplified objects)
+                        try:
+                            full_track = sp.track(item['id'], market=market)
+                            if is_valid_seed(full_track):
+                                candidate_pool.append(full_track)
+                                seen_ids.add(item['id'])
+                        except:
+                            continue
+
                         if len(candidate_pool) >= target_pool_size:
                             break
-        except:
+        except Exception as e:
+            logger.warning(f"Album search failed for artist {aid}: {e}")
             continue
 
-    # Strategy 4: User's saved tracks (recent additions)
-    try:
-        saved_tracks = sp.current_user_saved_tracks(limit=50, market=market)
-        for item in saved_tracks.get('items', []):
-            track = item.get('track')
-            if (track and track.get('id') and
-                    track['id'] not in seen_ids and
-                    is_valid_seed(track)):
-                candidate_pool.append(track)
-                seen_ids.add(track['id'])
-    except:
-        pass
+    logger.info(f"  After album dive: {len(candidate_pool)} candidates")
+
+    # STRATEGY 4: User's liked songs (for context, lower priority)
+    if len(candidate_pool) < target_pool_size:
+        try:
+            saved_tracks = sp.current_user_saved_tracks(limit=50, market=market)
+            for item in saved_tracks.get('items', []):
+                track = item.get('track')
+                if (track and track.get('id') and
+                        track['id'] not in seen_ids and
+                        is_valid_seed(track)):
+                    candidate_pool.append(track)
+                    seen_ids.add(track['id'])
+        except Exception as e:
+            logger.warning(f"Saved tracks fetch failed: {e}")
+
+    logger.info(f"Final candidate pool: {len(candidate_pool)} tracks")
 
     if not candidate_pool:
         raise HTTPException(
             status_code=500,
-            detail="Unable to generate recommendations. Please try adding more artists to your library."
+            detail="Unable to generate recommendations. Try following more artists or adding songs to your library."
         )
-
-    logger.info(f"Generated {len(candidate_pool)} candidates from search and albums")
 
     # --- AI SCORING ---
     now_bucket = get_time_bucket(datetime.datetime.utcnow().hour)
@@ -381,6 +403,8 @@ async def recommend(request: RecommendRequest):
     if not meta:
         raise HTTPException(status_code=500, detail="No valid tracks to score")
 
+    logger.info(f"Scoring {len(meta)} tracks with ML models...")
+
     X = pd.DataFrame(rows, columns=[
         "day_of_week",
         "artist_global_plays",
@@ -400,17 +424,18 @@ async def recommend(request: RecommendRequest):
             logger.error(f"Model scoring failed: {e}")
             scores = [random.random() for _ in meta]
 
-    # --- FINAL FILTERING ---
+    # --- FINAL FILTERING & RANKING ---
     final = []
     artist_cap = Counter()
 
     ranked = sorted(zip(meta, scores), key=lambda x: x[1], reverse=True)
 
     for item, score in ranked:
+        # Limit tracks per artist for diversity
         if artist_cap[item["artist"]] >= 2:
             continue
 
-        # Boost discovery (artists not in listening history)
+        # Boost discovery (new artists)
         boost = 1.3 if item["artist_plays"] == 0 else 1.0
         item["score"] = float(score) * boost
 
@@ -420,7 +445,7 @@ async def recommend(request: RecommendRequest):
         if len(final) >= request.size:
             break
 
-    logger.info(f"Returning {len(final)} recommendations")
+    logger.info(f"✓ Returning {len(final)} recommendations")
     return {"recommendations": final}
 
 
