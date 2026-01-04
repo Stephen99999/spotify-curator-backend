@@ -432,7 +432,7 @@ async def recommend(request: RecommendRequest):
 
     for item, score in ranked:
         # Limit tracks per artist for diversity
-        if artist_cap[item["artist"]] >= 2:
+        if artist_cap[item["artist"]] >= 5:
             continue
 
         # Boost discovery (new artists)
