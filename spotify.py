@@ -65,36 +65,23 @@ sp_oauth = SpotifyOAuth(
 )
 
 
-# --- DIVERSITY ENGINE (NEW) ---
-def get_jittered_params():
-    """
-    Returns random tunable attributes to force Spotify's API
-    to look in different 'corners' of the music graph.
-    """
-    targets = {}
+# --- HELPER: IS THIS MUSIC? ---
+def is_valid_seed(track: dict) -> bool:
+    """Filters out Audiobooks, Podcasts, and weird metadata."""
+    if not track: return False
+    name = track.get("name", "").lower()
 
-    # Roll a die to decide the 'vibe' of this specific batch
-    roll = random.random()
+    # 1. Title Heuristics (Audiobooks often start with 'Chapter')
+    bad_prefixes = ["chapter ", "episode ", "part ", "intro"]
+    if any(name.startswith(p) for p in bad_prefixes):
+        return False
 
-    if roll < 0.25:
-        # Mode 1: High Energy / Upbeat
-        targets['min_energy'] = 0.6
-        targets['target_energy'] = 0.8
-    elif roll < 0.50:
-        # Mode 2: Chill / Acoustic
-        targets['max_energy'] = 0.6
-        targets['target_acousticness'] = 0.7
-    elif roll < 0.75:
-        # Mode 3: Deep Cuts (Low Popularity)
-        targets['max_popularity'] = 60
-    else:
-        # Mode 4: High Valence (Happy)
-        targets['min_valence'] = 0.6
+    # 2. Duration (Audiobook chapters can be very short or very long)
+    duration_ms = track.get("duration_ms", 0)
+    if duration_ms < 30000:  # Skip tracks under 30s
+        return False
 
-    # Always add a little bit of chaos to danceability
-    targets['target_danceability'] = random.uniform(0.3, 0.9)
-
-    return targets
+    return True
 
 
 # --- FEATURE HELPERS ---
@@ -121,17 +108,18 @@ def extract_features(artist_id: str, day: int, current_time_bucket: str, artist_
     ]
 
 
-# --- HYBRID HISTORY FETCHING ---
-def get_user_context_hybrid(sp):
+# --- HYBRID HISTORY FETCHING (CLEANED) ---
+def get_clean_history(sp):
+    """Fetches history but aggressively removes audiobooks/duplicates."""
     combined_tracks = []
     seen_ids = set()
 
-    # 1. Recent History (Immediate Context)
+    # 1. Recent History
     try:
         recent_results = sp.current_user_recently_played(limit=50)
         for item in recent_results.get('items', []):
             track = item.get("track")
-            if track and track.get("id") and track["id"] not in seen_ids:
+            if is_valid_seed(track) and track["id"] not in seen_ids:
                 track["_source"] = "recent"
                 track["played_at"] = item.get("played_at")
                 combined_tracks.append(track)
@@ -139,11 +127,11 @@ def get_user_context_hybrid(sp):
     except:
         pass
 
-    # 2. Top Tracks (Broad Context)
+    # 2. Top Tracks (Weekly Context)
     try:
         top_results = sp.current_user_top_tracks(limit=50, time_range="short_term")
         for track in top_results.get('items', []):
-            if track and track.get("id") and track["id"] not in seen_ids:
+            if is_valid_seed(track) and track["id"] not in seen_ids:
                 track["_source"] = "top_weekly"
                 track["played_at"] = None
                 combined_tracks.append(track)
@@ -162,33 +150,35 @@ async def recommend(request: RecommendRequest):
 
     sp = spotipy.Spotify(auth=request.token, requests_timeout=10, retries=2)
 
-    # 0. Market Check
     try:
-        user_info = sp.current_user()
-        market = user_info.get("country", "US")
+        market = sp.current_user().get("country", "US")
     except:
         market = "US"
 
-    # 1. HYBRID FETCH
-    context_pool = get_user_context_hybrid(sp)
-    if not context_pool:
-        raise HTTPException(status_code=400, detail="No listening history found.")
+    # 1. Get Clean Seeds (No Audiobooks!)
+    context_pool = get_clean_history(sp)
 
-    # 2. Build Profiles
-    seed_track_ids = []
+    if len(context_pool) < 5:
+        # Emergency Fallback if history is ONLY audiobooks
+        top_global = sp.playlist_tracks("37i9dQZEVXbMDoHDwVN2tF", limit=10, market=market)
+        context_pool = [t['track'] for t in top_global['items'] if is_valid_seed(t['track'])]
+
+    # 2. Prepare Data
+    seed_track_ids = [t['id'] for t in context_pool]
     artist_counts = Counter()
-    now_bucket = get_time_bucket(datetime.datetime.utcnow().hour)
+    seed_artist_ids = []
 
+    now_bucket = get_time_bucket(datetime.datetime.utcnow().hour)
     user_time_buckets = []
     track_bucket_map = {}
 
     for t in context_pool:
         tid = t.get("id")
-        seed_track_ids.append(tid)
-
         if t.get("artists"):
             aid = t["artists"][0].get("id")
-            if aid: artist_counts[aid] += 1
+            if aid:
+                artist_counts[aid] += 1
+                seed_artist_ids.append(aid)
 
         ts = t.get("played_at")
         bucket = now_bucket
@@ -198,69 +188,66 @@ async def recommend(request: RecommendRequest):
                 bucket = get_time_bucket(dt.hour)
             except:
                 pass
-
         user_time_buckets.append(bucket)
         track_bucket_map.setdefault(tid, []).append(bucket)
 
-    # 3. GENERATE CANDIDATES (WITH JITTER)
-    target_pool_size = request.size * 3
+    # 3. GENERATE CANDIDATES (The "Related Artist Hop")
+    # We need a large pool to filter out duplicates later
+    target_pool_size = request.size * 4
     candidate_pool = []
     seen_cand_ids = set(seed_track_ids)
 
-    unique_seeds = list(dict.fromkeys(seed_track_ids))
-    # CRITICAL: Shuffle seeds so we don't always pick the same top 5
+    # A. Standard Recommendations (Jittered)
+    unique_seeds = list(set(seed_track_ids))
     random.shuffle(unique_seeds)
-
-    batches = [unique_seeds[i:i + 5] for i in range(0, len(unique_seeds), 5)]
-    batches = batches[:12]  # Up to 60 seeds processed
+    batches = [unique_seeds[i:i + 5] for i in range(0, len(unique_seeds), 5)][:8]
 
     for batch in batches:
-        if len(candidate_pool) >= target_pool_size: break
-
-        # Get random params for this specific batch
-        jitter_params = get_jittered_params()
-
+        if len(candidate_pool) >= target_pool_size // 2: break
         try:
+            # High variety settings
             recs = sp.recommendations(
-                seed_tracks=batch,
-                limit=50,
-                country=market,
-                **jitter_params  # <--- Inject Chaos Here
+                seed_tracks=batch, limit=50, country=market,
+                min_popularity=10, max_popularity=85  # Avoid super-mainstream
             )
-            if recs and 'tracks' in recs:
-                for t in recs['tracks']:
-                    if t['id'] not in seen_cand_ids:
-                        candidate_pool.append(t)
-                        seen_cand_ids.add(t['id'])
+            for t in recs.get('tracks', []):
+                if t['id'] not in seen_cand_ids and is_valid_seed(t):
+                    candidate_pool.append(t)
+                    seen_cand_ids.add(t['id'])
         except:
             continue
 
-    # Fallback
-    if len(candidate_pool) < request.size:
-        top_artists = [a for a, c in artist_counts.most_common(5)]
-        for aid in top_artists:
+    # B. The "Hop" Strategy (Forces Discovery)
+    # Instead of "Top tracks by User's Artist", do "Top tracks by RELATED Artist"
+    if seed_artist_ids:
+        random.shuffle(seed_artist_ids)
+        for aid in seed_artist_ids[:5]:  # Take 5 random artists user likes
             if len(candidate_pool) >= target_pool_size: break
             try:
-                top_t = sp.artist_top_tracks(aid, country=market).get("tracks", [])
-                for t in top_t:
-                    if t['id'] not in seen_cand_ids:
-                        candidate_pool.append(t)
-                        seen_cand_ids.add(t['id'])
+                # Find who sounds like them
+                related = sp.artist_related_artists(aid)
+                if related and 'artists' in related:
+                    # Pick a random related artist (Discovery!)
+                    rel_art = random.choice(related['artists'][:5])
+
+                    # Get THAT artist's top tracks
+                    top = sp.artist_top_tracks(rel_art['id'], country=market)
+                    for t in top.get('tracks', [])[:5]:  # Only take top 5
+                        if t['id'] not in seen_cand_ids and is_valid_seed(t):
+                            candidate_pool.append(t)
+                            seen_cand_ids.add(t['id'])
             except:
                 continue
 
     if not candidate_pool:
-        raise HTTPException(status_code=400, detail="No recs found.")
+        raise HTTPException(status_code=400, detail="Could not generate songs.")
 
-    # 4. SCORING
+    # 4. SCORING & DIVERSIFYING
     meta = []
     prediction_rows = []
 
-    # Shuffle the candidate pool before scoring to avoid "Top 50" bias from Spotify
-    random.shuffle(candidate_pool)
-    candidate_pool = candidate_pool[:target_pool_size]
-
     day = datetime.datetime.utcnow().weekday()
+    random.shuffle(candidate_pool)  # Shuffle to break clusters
 
     for t in candidate_pool:
         tid = t.get("id")
@@ -285,10 +272,9 @@ async def recommend(request: RecommendRequest):
             "score": 0.0
         })
 
-    # Predict
+    # AI Prediction
     cols = ["day_of_week", "artist_global_plays", "user_affinity", "track_context_weight",
             "time_bucket_afternoon", "time_bucket_evening", "time_bucket_night"]
-
     X = pd.DataFrame(prediction_rows, columns=cols).fillna(0.0)
 
     with model_lock:
@@ -297,14 +283,33 @@ async def recommend(request: RecommendRequest):
             p2 = model_lgbm.predict_proba(X)[:, 1]
             final_scores = (p1 + p2) / 2
         except:
-            final_scores = [0.5] * len(meta)
+            final_scores = [random.random() for _ in range(len(meta))]
 
-    for i, score in enumerate(final_scores):
-        boost = 1.15 if meta[i]["artist_plays"] == 0 else 1.0
-        meta[i]["score"] = float(score) * boost
+    # 5. STRICT FINAL FILTERING (Artist Cap)
+    final_recs = []
+    final_artist_counts = Counter()
 
-    results = sorted(meta, key=lambda x: x["score"], reverse=True)
-    return {"recommendations": results[:request.size]}
+    # Sort by AI score first
+    ranked_candidates = sorted(zip(meta, final_scores), key=lambda x: x[1], reverse=True)
+
+    for item, score in ranked_candidates:
+        artist_name = item["artist"]
+
+        # RULE: Max 2 songs per artist
+        if final_artist_counts[artist_name] >= 5:
+            continue
+
+        # RULE: Score Boost for new artists
+        boost = 1.2 if item["artist_plays"] == 0 else 1.0
+        item["score"] = float(score) * boost
+
+        final_recs.append(item)
+        final_artist_counts[artist_name] += 1
+
+        if len(final_recs) >= request.size:
+            break
+
+    return {"recommendations": final_recs}
 
 
 # --- AUTH & SAVE ---
@@ -326,10 +331,8 @@ async def save_playlist(request: PlaylistSaveRequest):
         uid = sp.current_user()["id"]
         pl = sp.user_playlist_create(uid, request.name, public=False)
         uris = [f"spotify:track:{id}" for id in request.track_ids]
-
         for i in range(0, len(uris), 100):
             sp.playlist_add_items(pl["id"], uris[i:i + 100])
-
         return {"status": "success", "url": pl["external_urls"]["spotify"]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
