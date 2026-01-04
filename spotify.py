@@ -27,7 +27,7 @@ class PlaylistSaveRequest(BaseModel):
 
 class RecommendRequest(BaseModel):
     token: str = Field(..., min_length=10)
-    size: int = Field(50, ge=1, le=100)  # Default 50, max 100
+    size: int = Field(50, ge=1, le=100)
 
 
 app = FastAPI(title="Discovery Playlist API")
@@ -65,6 +65,38 @@ sp_oauth = SpotifyOAuth(
 )
 
 
+# --- DIVERSITY ENGINE (NEW) ---
+def get_jittered_params():
+    """
+    Returns random tunable attributes to force Spotify's API
+    to look in different 'corners' of the music graph.
+    """
+    targets = {}
+
+    # Roll a die to decide the 'vibe' of this specific batch
+    roll = random.random()
+
+    if roll < 0.25:
+        # Mode 1: High Energy / Upbeat
+        targets['min_energy'] = 0.6
+        targets['target_energy'] = 0.8
+    elif roll < 0.50:
+        # Mode 2: Chill / Acoustic
+        targets['max_energy'] = 0.6
+        targets['target_acousticness'] = 0.7
+    elif roll < 0.75:
+        # Mode 3: Deep Cuts (Low Popularity)
+        targets['max_popularity'] = 60
+    else:
+        # Mode 4: High Valence (Happy)
+        targets['min_valence'] = 0.6
+
+    # Always add a little bit of chaos to danceability
+    targets['target_danceability'] = random.uniform(0.3, 0.9)
+
+    return targets
+
+
 # --- FEATURE HELPERS ---
 def get_time_bucket(hour: int) -> str:
     if hour < 5 or hour >= 22: return "night"
@@ -75,7 +107,6 @@ def get_time_bucket(hour: int) -> str:
 
 def extract_features(artist_id: str, day: int, current_time_bucket: str, artist_play_count: int,
                      user_time_buckets: List[str], track_time_buckets: List[str]):
-    # Helpers for density calc
     def get_affinity(hist, bucket):
         return (sum(1 for h in hist if h == bucket) / len(hist)) if hist else 0.5
 
@@ -92,40 +123,33 @@ def extract_features(artist_id: str, day: int, current_time_bucket: str, artist_
 
 # --- HYBRID HISTORY FETCHING ---
 def get_user_context_hybrid(sp):
-    """
-    Combines 'Recently Played' (immediate context) with 'Top Tracks' (weekly context)
-    to bypass the API's 50-track history limit.
-    """
     combined_tracks = []
     seen_ids = set()
 
-    # 1. Get the "Real" Recent History (Max 50)
-    # This captures your vibe RIGHT NOW.
+    # 1. Recent History (Immediate Context)
     try:
         recent_results = sp.current_user_recently_played(limit=50)
         for item in recent_results.get('items', []):
             track = item.get("track")
             if track and track.get("id") and track["id"] not in seen_ids:
-                # We attach a 'weight' to recent tracks to prioritize them slightly
                 track["_source"] = "recent"
-                track["played_at"] = item.get("played_at")  # Preserve timestamp
+                track["played_at"] = item.get("played_at")
                 combined_tracks.append(track)
                 seen_ids.add(track["id"])
-    except Exception as e:
-        print(f"⚠️ Recent History Error: {e}")
+    except:
+        pass
 
-    # 2. Get 'Short Term' Top Tracks (Last ~4 Weeks)
-    # This fills the "Sunday to Sunday" gap that history misses.
+    # 2. Top Tracks (Broad Context)
     try:
         top_results = sp.current_user_top_tracks(limit=50, time_range="short_term")
         for track in top_results.get('items', []):
             if track and track.get("id") and track["id"] not in seen_ids:
                 track["_source"] = "top_weekly"
-                track["played_at"] = None  # Top tracks don't have a specific timestamp
+                track["played_at"] = None
                 combined_tracks.append(track)
                 seen_ids.add(track["id"])
-    except Exception as e:
-        print(f"⚠️ Top Tracks Error: {e}")
+    except:
+        pass
 
     return combined_tracks
 
@@ -138,27 +162,23 @@ async def recommend(request: RecommendRequest):
 
     sp = spotipy.Spotify(auth=request.token, requests_timeout=10, retries=2)
 
-    # 0. Check User Market
+    # 0. Market Check
     try:
         user_info = sp.current_user()
         market = user_info.get("country", "US")
     except:
         market = "US"
 
-    # 1. HYBRID FETCH: Get ~100 tracks representing "The User's Week"
+    # 1. HYBRID FETCH
     context_pool = get_user_context_hybrid(sp)
-
     if not context_pool:
-        raise HTTPException(status_code=400, detail="Could not find any listening history.")
+        raise HTTPException(status_code=400, detail="No listening history found.")
 
-    # 2. Build Profiles (Artist Counts, Time Buckets)
+    # 2. Build Profiles
     seed_track_ids = []
     artist_counts = Counter()
-
-    # We use current time for context if the track came from 'top_tracks' (which has no timestamp)
     now_bucket = get_time_bucket(datetime.datetime.utcnow().hour)
 
-    # For feature extraction
     user_time_buckets = []
     track_bucket_map = {}
 
@@ -166,13 +186,10 @@ async def recommend(request: RecommendRequest):
         tid = t.get("id")
         seed_track_ids.append(tid)
 
-        # Artist Counts
         if t.get("artists"):
             aid = t["artists"][0].get("id")
             if aid: artist_counts[aid] += 1
 
-        # Time Bucket Logic
-        # If it came from history, use its real time. If from top tracks, assume "General User Vibe" (current time)
         ts = t.get("played_at")
         bucket = now_bucket
         if ts:
@@ -185,23 +202,31 @@ async def recommend(request: RecommendRequest):
         user_time_buckets.append(bucket)
         track_bucket_map.setdefault(tid, []).append(bucket)
 
-    # 3. GENERATE CANDIDATES
-    # We take random samples from our robust 100-song context pool
+    # 3. GENERATE CANDIDATES (WITH JITTER)
     target_pool_size = request.size * 3
     candidate_pool = []
     seen_cand_ids = set(seed_track_ids)
 
     unique_seeds = list(dict.fromkeys(seed_track_ids))
+    # CRITICAL: Shuffle seeds so we don't always pick the same top 5
     random.shuffle(unique_seeds)
 
-    # Create batches of 5 (Spotify Max Seeds)
     batches = [unique_seeds[i:i + 5] for i in range(0, len(unique_seeds), 5)]
-    batches = batches[:15]  # Increase breadth since we have more data now
+    batches = batches[:12]  # Up to 60 seeds processed
 
     for batch in batches:
         if len(candidate_pool) >= target_pool_size: break
+
+        # Get random params for this specific batch
+        jitter_params = get_jittered_params()
+
         try:
-            recs = sp.recommendations(seed_tracks=batch, limit=50, country=market)
+            recs = sp.recommendations(
+                seed_tracks=batch,
+                limit=50,
+                country=market,
+                **jitter_params  # <--- Inject Chaos Here
+            )
             if recs and 'tracks' in recs:
                 for t in recs['tracks']:
                     if t['id'] not in seen_cand_ids:
@@ -210,7 +235,7 @@ async def recommend(request: RecommendRequest):
         except:
             continue
 
-    # Fallback Mechanism: Fill from Top Artists if pool is small
+    # Fallback
     if len(candidate_pool) < request.size:
         top_artists = [a for a, c in artist_counts.most_common(5)]
         for aid in top_artists:
@@ -225,12 +250,16 @@ async def recommend(request: RecommendRequest):
                 continue
 
     if not candidate_pool:
-        raise HTTPException(status_code=400, detail="No recommendations found. Try listening to more music!")
+        raise HTTPException(status_code=400, detail="No recs found.")
 
-    # 4. SCORING (Standard)
+    # 4. SCORING
     meta = []
     prediction_rows = []
+
+    # Shuffle the candidate pool before scoring to avoid "Top 50" bias from Spotify
+    random.shuffle(candidate_pool)
     candidate_pool = candidate_pool[:target_pool_size]
+
     day = datetime.datetime.utcnow().weekday()
 
     for t in candidate_pool:
@@ -287,7 +316,6 @@ def login():
 @app.get("/callback")
 def callback(code: str):
     token = sp_oauth.get_access_token(code)
-    # Update this URL to match your frontend location
     return RedirectResponse(f"https://spotify-playlist-curator.vercel.app/home?token={token['access_token']}")
 
 
@@ -299,7 +327,6 @@ async def save_playlist(request: PlaylistSaveRequest):
         pl = sp.user_playlist_create(uid, request.name, public=False)
         uris = [f"spotify:track:{id}" for id in request.track_ids]
 
-        # Batching for large saves (Spotify limit 100)
         for i in range(0, len(uris), 100):
             sp.playlist_add_items(pl["id"], uris[i:i + 100])
 
