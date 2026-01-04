@@ -305,7 +305,7 @@ async def recommend(request: RecommendRequest):
         artist_name = item["artist"]
 
         # RULE: Max 2 songs per artist
-        if final_artist_counts[artist_name] >= 5:
+        if final_artist_counts[artist_name] >= 2:
             continue
 
         # RULE: Score Boost for new artists
