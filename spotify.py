@@ -7,13 +7,15 @@ from collections import Counter
 import pandas as pd
 import spotipy
 from pydantic import BaseModel, Field
-from typing import List, Dict, Optional
+from typing import List
 from spotipy.oauth2 import SpotifyOAuth
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from threading import Lock
 from dotenv import load_dotenv
+import logging
+from spotipy import SpotifyException
 
 load_dotenv()
 
@@ -142,183 +144,186 @@ def get_clean_history(sp):
     return combined_tracks
 
 
-# --- MAIN ENDPOINT ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("discovery_api")
+
+
+def is_spotify_id(s):
+    return isinstance(s, str) and len(s) in (22, 23)
+
+
 @app.post("/recommend")
 async def recommend(request: RecommendRequest):
     if not model_xgb:
         raise HTTPException(status_code=500, detail="Models not active")
 
     session = requests.Session()
-    session.trust_env = False  # ⛔ This stops your ISP from hijacking the request
+    session.trust_env = False
 
-    # Initialize Spotipy with this protected session
     sp = spotipy.Spotify(
         auth=request.token,
         requests_timeout=10,
         retries=2,
-        requests_session=session  # <--- Pass the session here
+        requests_session=session
     )
 
+    # --- TOKEN VALIDATION ---
     try:
-        market = sp.current_user().get("country", "US")
-    except:
-        market = "US"
+        user = sp.current_user()
+        market = user.get("country", "US")
+    except SpotifyException as e:
+        raise HTTPException(
+            status_code=401,
+            detail=f"Invalid or expired Spotify token: {e}"
+        )
 
-    # 1. Get Clean Seeds (No Audiobooks!)
+    # --- CLEAN HISTORY ---
     context_pool = get_clean_history(sp)
 
     if len(context_pool) < 5:
-        # Emergency Fallback if history is ONLY audiobooks
-        top_global = sp.playlist_tracks("37i9dQZEVXbMDoHDwVN2tF", limit=10, market=market)
-        context_pool = [t['track'] for t in top_global['items'] if is_valid_seed(t['track'])]
+        top_global = sp.playlist_tracks(
+            "37i9dQZEVXbMDoHDwVN2tF", limit=10, market=market
+        )
+        context_pool = [
+            t['track'] for t in top_global['items']
+            if t.get('track') and is_valid_seed(t['track'])
+        ]
 
-    # 2. Prepare Data
-    seed_track_ids = [t['id'] for t in context_pool]
-    artist_counts = Counter()
-    seed_artist_ids = []
+    seed_track_ids = [
+        t['id'] for t in context_pool
+        if t.get('id') and is_spotify_id(t.get('id'))
+    ]
 
-    now_bucket = get_time_bucket(datetime.datetime.utcnow().hour)
-    user_time_buckets = []
-    track_bucket_map = {}
+    seed_artist_ids = [
+        t['artists'][0]['id']
+        for t in context_pool
+        if t.get('artists') and t['artists'][0].get('id')
+    ]
 
-    for t in context_pool:
-        tid = t.get("id")
-        if t.get("artists"):
-            aid = t["artists"][0].get("id")
-            if aid:
-                artist_counts[aid] += 1
-                seed_artist_ids.append(aid)
+    if not seed_track_ids:
+        raise HTTPException(status_code=400, detail="No valid seed tracks found.")
 
-        ts = t.get("played_at")
-        bucket = now_bucket
-        if ts:
-            try:
-                dt = datetime.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-                bucket = get_time_bucket(dt.hour)
-            except:
-                pass
-        user_time_buckets.append(bucket)
-        track_bucket_map.setdefault(tid, []).append(bucket)
-
-    # 3. GENERATE CANDIDATES (The "Related Artist Hop")
-    # We need a large pool to filter out duplicates later
+    # --- CANDIDATE GENERATION ---
     target_pool_size = request.size * 4
     candidate_pool = []
-    seen_cand_ids = set(seed_track_ids)
+    seen_ids = set(seed_track_ids)
 
-    # A. Standard Recommendations (Jittered)
-    unique_seeds = list(set(seed_track_ids))
-    random.shuffle(unique_seeds)
-    batches = [unique_seeds[i:i + 5] for i in range(0, len(unique_seeds), 5)][:8]
+    random.shuffle(seed_track_ids)
+    batches = [seed_track_ids[i:i + 5] for i in range(0, len(seed_track_ids), 5)][:8]
 
     for batch in batches:
-        if len(candidate_pool) >= target_pool_size // 2: break
+        if len(candidate_pool) >= target_pool_size // 2:
+            break
         try:
-            # High variety settings
             recs = sp.recommendations(
-                seed_tracks=batch, limit=50, country=market,
-                min_popularity=10, max_popularity=85  # Avoid super-mainstream
+                seed_tracks=batch,
+                limit=50,
+                market=market,
+                min_popularity=10,
+                max_popularity=85
             )
-            for t in recs.get('tracks', []):
-                if t['id'] not in seen_cand_ids and is_valid_seed(t):
+            for t in recs.get("tracks", []):
+                if t.get("id") and t["id"] not in seen_ids and is_valid_seed(t):
                     candidate_pool.append(t)
-                    seen_cand_ids.add(t['id'])
-        except:
+                    seen_ids.add(t["id"])
+        except SpotifyException as e:
+            logger.error(f"Spotify rec error ({e.http_status}): {e} | seeds={batch}")
             continue
 
-    # B. The "Hop" Strategy (Forces Discovery)
-    # Instead of "Top tracks by User's Artist", do "Top tracks by RELATED Artist"
-    if seed_artist_ids:
-        random.shuffle(seed_artist_ids)
-        for aid in seed_artist_ids[:5]:  # Take 5 random artists user likes
-            if len(candidate_pool) >= target_pool_size: break
-            try:
-                # Find who sounds like them
-                related = sp.artist_related_artists(aid)
-                if related and 'artists' in related:
-                    # Pick a random related artist (Discovery!)
-                    rel_art = random.choice(related['artists'][:5])
+    # --- RELATED ARTIST HOP ---
+    random.shuffle(seed_artist_ids)
 
-                    # Get THAT artist's top tracks
-                    top = sp.artist_top_tracks(rel_art['id'], country=market)
-                    for t in top.get('tracks', [])[:5]:  # Only take top 5
-                        if t['id'] not in seen_cand_ids and is_valid_seed(t):
-                            candidate_pool.append(t)
-                            seen_cand_ids.add(t['id'])
-            except:
-                continue
+    for aid in seed_artist_ids[:5]:
+        if len(candidate_pool) >= target_pool_size:
+            break
+        try:
+            related = sp.artist_related_artists(aid)
+            rel_art = random.choice(related["artists"][:5])
+            top_tracks = sp.artist_top_tracks(rel_art["id"], market=market)
+
+            for t in top_tracks.get("tracks", [])[:5]:
+                if t.get("id") and t["id"] not in seen_ids and is_valid_seed(t):
+                    candidate_pool.append(t)
+                    seen_ids.add(t["id"])
+        except SpotifyException as e:
+            logger.warning(f"Related artist skip ({e.http_status}): {aid}")
+            continue
 
     if not candidate_pool:
-        raise HTTPException(status_code=400, detail="Could not generate songs.")
+        raise HTTPException(status_code=400, detail="Spotify returned no recommendations.")
 
-    # 4. SCORING & DIVERSIFYING
-    meta = []
-    prediction_rows = []
-
+    # --- AI SCORING ---
+    now_bucket = get_time_bucket(datetime.datetime.utcnow().hour)
     day = datetime.datetime.utcnow().weekday()
-    random.shuffle(candidate_pool)  # Shuffle to break clusters
+
+    artist_counts = Counter(seed_artist_ids)
+    user_time_buckets = [now_bucket]
+
+    meta = []
+    rows = []
 
     for t in candidate_pool:
-        tid = t.get("id")
-        art = t.get("artists", [{}])[0]
-        aid = art.get("id", "")
-
-        feats = extract_features(
-            aid, day, now_bucket,
-            artist_counts.get(aid, 0),
-            user_time_buckets,
-            track_bucket_map.get(tid, [])
+        aid = t["artists"][0]["id"]
+        rows.append(
+            extract_features(
+                aid,
+                day,
+                now_bucket,
+                artist_counts.get(aid, 0),
+                user_time_buckets,
+                [now_bucket]
+            )
         )
-        prediction_rows.append(feats)
 
         meta.append({
-            "id": tid,
-            "name": t.get("name"),
-            "artist": art.get("name"),
-            "url": t.get("external_urls", {}).get("spotify"),
-            "albumArt": (t.get("album", {}).get("images") or [{}])[0].get("url"),
+            "id": t["id"],
+            "name": t["name"],
+            "artist": t["artists"][0]["name"],
+            "url": t["external_urls"]["spotify"],
+            "albumArt": t["album"]["images"][0]["url"] if t["album"]["images"] else None,
             "artist_plays": artist_counts.get(aid, 0),
             "score": 0.0
         })
 
-    # AI Prediction
-    cols = ["day_of_week", "artist_global_plays", "user_affinity", "track_context_weight",
-            "time_bucket_afternoon", "time_bucket_evening", "time_bucket_night"]
-    X = pd.DataFrame(prediction_rows, columns=cols).fillna(0.0)
+    X = pd.DataFrame(rows, columns=[
+        "day_of_week",
+        "artist_global_plays",
+        "user_affinity",
+        "track_context_weight",
+        "time_bucket_afternoon",
+        "time_bucket_evening",
+        "time_bucket_night"
+    ]).fillna(0)
 
     with model_lock:
         try:
             p1 = model_xgb.predict_proba(X)[:, 1]
             p2 = model_lgbm.predict_proba(X)[:, 1]
-            final_scores = (p1 + p2) / 2
-        except:
-            final_scores = [random.random() for _ in range(len(meta))]
+            scores = (p1 + p2) / 2
+        except Exception:
+            scores = [random.random() for _ in meta]
 
-    # 5. STRICT FINAL FILTERING (Artist Cap)
-    final_recs = []
-    final_artist_counts = Counter()
+    # --- FINAL FILTERING ---
+    final = []
+    artist_cap = Counter()
 
-    # Sort by AI score first
-    ranked_candidates = sorted(zip(meta, final_scores), key=lambda x: x[1], reverse=True)
+    ranked = sorted(zip(meta, scores), key=lambda x: x[1], reverse=True)
 
-    for item, score in ranked_candidates:
-        artist_name = item["artist"]
-
-        # RULE: Max 2 songs per artist
-        if final_artist_counts[artist_name] >= 2:
+    for item, score in ranked:
+        if artist_cap[item["artist"]] >= 2:
             continue
 
-        # RULE: Score Boost for new artists
         boost = 1.2 if item["artist_plays"] == 0 else 1.0
         item["score"] = float(score) * boost
 
-        final_recs.append(item)
-        final_artist_counts[artist_name] += 1
+        final.append(item)
+        artist_cap[item["artist"]] += 1
 
-        if len(final_recs) >= request.size:
+        if len(final) >= request.size:
             break
 
-    return {"recommendations": final_recs}
+    return {"recommendations": final}
+
 
 
 # --- AUTH & SAVE ---
