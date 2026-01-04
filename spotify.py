@@ -2,7 +2,7 @@ import os
 import joblib
 import datetime
 import random
-import time
+import requests
 from collections import Counter
 import pandas as pd
 import spotipy
@@ -148,7 +148,16 @@ async def recommend(request: RecommendRequest):
     if not model_xgb:
         raise HTTPException(status_code=500, detail="Models not active")
 
-    sp = spotipy.Spotify(auth=request.token, requests_timeout=10, retries=2)
+    session = requests.Session()
+    session.trust_env = False  # ⛔ This stops your ISP from hijacking the request
+
+    # Initialize Spotipy with this protected session
+    sp = spotipy.Spotify(
+        auth=request.token,
+        requests_timeout=10,
+        retries=2,
+        requests_session=session  # <--- Pass the session here
+    )
 
     try:
         market = sp.current_user().get("country", "US")
