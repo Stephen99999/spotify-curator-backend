@@ -154,10 +154,6 @@ def is_spotify_id(s):
 
 @app.post("/recommend")
 async def recommend(request: RecommendRequest):
-    """
-    Recommendation system using ONLY non-deprecated Spotify API endpoints.
-    No /recommendations, /audio-features, or /related-artists used.
-    """
     if not model_xgb:
         raise HTTPException(status_code=500, detail="Models not active")
 
@@ -235,16 +231,20 @@ async def recommend(request: RecommendRequest):
     # --- BUILD CANDIDATE POOL ---
     target_pool_size = request.size * 4
     candidate_pool = []
-    seen_ids = set([t['id'] for t in context_pool])
+    seen_ids = set([t['id'] for t in context_pool])  # Excludes recently played from recommendations
 
     logger.info(f"Building candidate pool (target: {target_pool_size})...")
 
-    # STRATEGY 1: Search by similar artists (60% of pool)
+    # STRATEGY 1: Search by artists you know (75% of pool - familiar tracks)
     random.shuffle(artist_names)
     search_artists = [a for a in artist_names if a][:20]
+    known_artists_set = set(search_artists)  # Artists from your history
+
+    familiar_pool = []
+    discovery_pool = []
 
     for i in range(0, len(search_artists), 2):
-        if len(candidate_pool) >= target_pool_size * 0.6:
+        if len(familiar_pool) >= target_pool_size * 0.75:
             break
 
         query_artists = search_artists[i:i + 2]
@@ -257,25 +257,32 @@ async def recommend(request: RecommendRequest):
                 if not item.get('id') or item['id'] in seen_ids or not is_valid_seed(item):
                     continue
 
-                # Filter: prefer tracks NOT from top 5 artists (for discovery)
+                # Separate familiar vs discovery based on artist
                 item_artists = [a.get('name', '') for a in item.get('artists', [])]
-                if not any(a in search_artists[:5] for a in item_artists):
-                    candidate_pool.append(item)
+                is_familiar = any(a in known_artists_set for a in item_artists)
+
+                if is_familiar and len(familiar_pool) < target_pool_size * 0.75:
+                    familiar_pool.append(item)
+                    seen_ids.add(item['id'])
+                elif not is_familiar and len(discovery_pool) < target_pool_size * 0.25:
+                    discovery_pool.append(item)
                     seen_ids.add(item['id'])
 
         except Exception as e:
             logger.warning(f"Search failed for artists {query_artists}: {e}")
             continue
 
-    logger.info(f"  After artist search: {len(candidate_pool)} candidates")
+    candidate_pool = familiar_pool + discovery_pool
+    logger.info(
+        f"  After artist search: {len(familiar_pool)} familiar + {len(discovery_pool)} discovery = {len(candidate_pool)} candidates")
 
-    # STRATEGY 2: Genre-based search (if we have genres)
-    if all_genres:
+    # STRATEGY 2: Genre-based search (only for discovery if needed)
+    if all_genres and len(discovery_pool) < target_pool_size * 0.25:
         genre_counts = Counter(all_genres)
         top_genres = [g for g, _ in genre_counts.most_common(8)]
 
         for genre in top_genres:
-            if len(candidate_pool) >= target_pool_size * 0.8:
+            if len(discovery_pool) >= target_pool_size * 0.25:
                 break
 
             try:
@@ -288,9 +295,13 @@ async def recommend(request: RecommendRequest):
                 )
 
                 for item in results.get('tracks', {}).get('items', []):
-                    if (item.get('id') and
-                            item['id'] not in seen_ids and
-                            is_valid_seed(item)):
+                    if not (item.get('id') and item['id'] not in seen_ids and is_valid_seed(item)):
+                        continue
+
+                    # Only add if artist is NOT in known list (pure discovery)
+                    item_artists = [a.get('name', '') for a in item.get('artists', [])]
+                    if not any(a in known_artists_set for a in item_artists):
+                        discovery_pool.append(item)
                         candidate_pool.append(item)
                         seen_ids.add(item['id'])
 
@@ -298,11 +309,12 @@ async def recommend(request: RecommendRequest):
                 logger.warning(f"Genre search failed for '{genre}': {e}")
                 continue
 
-        logger.info(f"  After genre search: {len(candidate_pool)} candidates")
+        logger.info(
+            f"  After genre search: {len(familiar_pool)} familiar + {len(discovery_pool)} discovery = {len(candidate_pool)} candidates")
 
-    # STRATEGY 3: Deep dive into artists' albums
+    # STRATEGY 3: Deep dive into known artists' albums (familiar content)
     for aid in unique_artist_ids[:15]:
-        if len(candidate_pool) >= target_pool_size:
+        if len(familiar_pool) >= target_pool_size * 0.75:
             break
 
         try:
@@ -323,21 +335,23 @@ async def recommend(request: RecommendRequest):
                         try:
                             full_track = sp.track(item['id'], market=market)
                             if is_valid_seed(full_track):
+                                familiar_pool.append(full_track)
                                 candidate_pool.append(full_track)
                                 seen_ids.add(item['id'])
                         except:
                             continue
 
-                        if len(candidate_pool) >= target_pool_size:
+                        if len(familiar_pool) >= target_pool_size * 0.75:
                             break
         except Exception as e:
             logger.warning(f"Album search failed for artist {aid}: {e}")
             continue
 
-    logger.info(f"  After album dive: {len(candidate_pool)} candidates")
+    logger.info(
+        f"  After album dive: {len(familiar_pool)} familiar + {len(discovery_pool)} discovery = {len(candidate_pool)} candidates")
 
-    # STRATEGY 4: User's liked songs (for context, lower priority)
-    if len(candidate_pool) < target_pool_size:
+    # STRATEGY 4: User's liked songs (familiar content only)
+    if len(familiar_pool) < target_pool_size * 0.75:
         try:
             saved_tracks = sp.current_user_saved_tracks(limit=50, market=market)
             for item in saved_tracks.get('items', []):
@@ -345,12 +359,17 @@ async def recommend(request: RecommendRequest):
                 if (track and track.get('id') and
                         track['id'] not in seen_ids and
                         is_valid_seed(track)):
+                    familiar_pool.append(track)
                     candidate_pool.append(track)
                     seen_ids.add(track['id'])
+
+                    if len(familiar_pool) >= target_pool_size * 0.75:
+                        break
         except Exception as e:
             logger.warning(f"Saved tracks fetch failed: {e}")
 
-    logger.info(f"Final candidate pool: {len(candidate_pool)} tracks")
+    logger.info(
+        f"Final candidate pool: {len(familiar_pool)} familiar (75%) + {len(discovery_pool)} discovery (25%) = {len(candidate_pool)} total")
 
     if not candidate_pool:
         raise HTTPException(
@@ -435,8 +454,8 @@ async def recommend(request: RecommendRequest):
         if artist_cap[item["artist"]] >= 5:
             continue
 
-        # Boost discovery (new artists)
-        boost = 1.3 if item["artist_plays"] == 0 else 1.0
+        # Boost discovery slightly (new artists) but keep it modest
+        boost = 1.15 if item["artist_plays"] == 0 else 1.0
         item["score"] = float(score) * boost
 
         final.append(item)
