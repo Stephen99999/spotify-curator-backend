@@ -22,7 +22,7 @@ CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 REDIRECT_URI = os.getenv("REDIRECT_URI")
 
-app = FastAPI(title="Public Universal Discovery API")
+app = FastAPI(title="Private Style Discovery API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,7 +32,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Shared OAuth object (stateless)
 sp_oauth = SpotifyOAuth(
     client_id=CLIENT_ID,
     client_secret=CLIENT_SECRET,
@@ -40,29 +39,24 @@ sp_oauth = SpotifyOAuth(
     scope=SCOPE
 )
 
-# ML MODELS (Loaded once, used as read-only by multiple threads)
 model_lock = Lock()
 try:
     model_xgb = joblib.load("discovery_xgb_finetuned.pkl")
     model_lgbm = joblib.load("discovery_lgbm_finetuned.pkl")
-    print("✅ ML Models Ready for Multi-User Traffic")
+    print("✅ ML Models Ready")
 except Exception as e:
     print(f"❌ Model Load Error: {e}")
 
-
-# --- SCHEMAS ---
 class RecommendRequest(BaseModel):
     token: str = Field(..., min_length=10)
     size: int = Field(50, ge=1, le=100)
-
 
 class PlaylistSaveRequest(BaseModel):
     token: str
     track_ids: List[str]
     name: str = "My AI Discovery Mix"
 
-
-# --- HELPER: NO GLOBAL LEAKAGE ---
+# --- HELPER: USER-CENTRIC CONTEXT ---
 def get_time_bucket() -> str:
     hour = datetime.datetime.now().hour
     if hour < 5 or hour >= 22: return "night"
@@ -70,92 +64,76 @@ def get_time_bucket() -> str:
     if 12 <= hour < 17: return "afternoon"
     return "evening"
 
-
-# --- ROUTES ---
-
-@app.get("/login")
-def login():
-    return RedirectResponse(sp_oauth.get_authorize_url())
-
-
-@app.get("/callback")
-def callback(code: str):
-    token_info = sp_oauth.get_access_token(code)
-    access_token = token_info['access_token']
-    # Redirecting to Vercel with the private token
-    return RedirectResponse(f"https://spotify-playlist-curator.vercel.app/home?token={access_token}")
-
-
 @app.post("/recommend")
 async def recommend(request: RecommendRequest):
     sp = spotipy.Spotify(auth=request.token)
     try:
-        # 1. PROFILE FINGERPRINTING
+        # 1. PROFILE FINGERPRINTING (The Style Anchor)
         user = sp.current_user()
         market = user.get("country", "US")
 
-        # Pull Short Term (Current Vibes) vs Medium Term (Actual Style)
+        # Pull personal history
         st_tracks = sp.current_user_top_tracks(limit=50, time_range='short_term')['items']
         mt_tracks = sp.current_user_top_tracks(limit=50, time_range='medium_term')['items']
 
-        # 2. SEED WEIGHTING (Isolation of Style)
-        # We don't just use genres; we use specific Artist IDs to find "Sonic Cousins"
+        # 2. ISOLATION: Calculate User-Specific Weights
+        # This prevents "leakage" because 'user_affinity' is now unique to this user's data
         style_seeds = []
-        # Short term artists get 2x weight because they define the current "vibe"
         for t in st_tracks: style_seeds.append((t['artists'][0]['id'], 1.0))
         for t in mt_tracks: style_seeds.append((t['artists'][0]['id'], 0.5))
 
-        # Get unique top artists for this specific user
         artist_counts = Counter([s[0] for s in style_seeds])
-        top_style_artists = [a for a, _ in artist_counts.most_common(10)]
+        top_style_artists = [a for a, _ in artist_counts.most_common(12)]
 
-        # 3. SCAVENGING THE CANDIDATE POOL
+        # 3. CANDIDATE SCAVENGING
         candidate_pool = []
         seen_ids = set([t['id'] for t in st_tracks] + [t['id'] for t in mt_tracks])
 
         for artist_id in top_style_artists:
             try:
-                # Get Related Artists - This is the key to non-generic discovery
-                # It finds what fans of YOUR favorite artist also like
+                # Use Related Artists to find sonic neighbors
                 related = sp.artist_related_artists(artist_id)['artists'][:5]
                 for r_art in related:
-                    # Get their top tracks (The "Hidden Gems" of that style)
                     r_tracks = sp.artist_top_tracks(r_art['id'], country=market)['tracks'][:3]
                     for rt in r_tracks:
                         if rt['id'] not in seen_ids:
-                            # Attach custom affinity for the ML model
-                            rt['_user_affinity'] = artist_counts[artist_id] / 10.0
+                            # User-specific affinity score (prevents global leakage)
+                            rt['_user_affinity'] = float(artist_counts[artist_id] / max(artist_counts.values()))
                             candidate_pool.append(rt)
                             seen_ids.add(rt['id'])
             except:
                 continue
 
-        # 4. ML SCORING (The Personal Bouncer)
+        # 4. ML SCORING (Fixed for Dtypes and Isolation)
         vibe = get_time_bucket()
-        day = datetime.datetime.now().weekday()
+        day = float(datetime.datetime.now().weekday())
         rows, meta = [], []
 
         for t in candidate_pool:
+            # Explicitly casting to float to satisfy XGBoost/LGBM Requirements
             rows.append([
                 day,
                 float(t.get('popularity', 50)),
-                t.get('_user_affinity', 0.5),  # User-specific style weight
-                1.0,  # context weight
+                float(t.get('_user_affinity', 0.5)),
+                1.0,  # Personal track context weight
                 1.0 if vibe == "afternoon" else 0.0,
                 1.0 if vibe == "evening" else 0.0,
                 1.0 if vibe == "night" else 0.0
             ])
             meta.append({
-                "id": t["id"], "name": t["name"], "artist": t["artists"][0]["name"],
+                "id": t["id"],
+                "name": t["name"],
+                "artist": t["artists"][0]["name"],
                 "url": t["external_urls"]["spotify"],
                 "albumArt": t["album"]["images"][0]["url"] if t["album"].get("images") else None
             })
 
+        # Convert to DataFrame and FORCE float types
         X = pd.DataFrame(rows, columns=[
             "day_of_week", "artist_global_plays", "user_affinity",
             "track_context_weight", "time_bucket_afternoon",
             "time_bucket_evening", "time_bucket_night"
-        ])
+        ]).astype('float64')
 
         with model_lock:
             p1 = model_xgb.predict_proba(X)[:, 1]
@@ -165,11 +143,11 @@ async def recommend(request: RecommendRequest):
         for i, score in enumerate(scores):
             meta[i]["score"] = float(score)
 
-        # 5. DIVERSITY FILTER (No more than 3 tracks per artist)
+        # 5. DIVERSITY FILTER
         final = []
         artist_cap = Counter()
         for item in sorted(meta, key=lambda x: x['score'], reverse=True):
-            if artist_cap[item["artist"]] < 4:
+            if artist_cap[item["artist"]] < 3:
                 final.append(item)
                 artist_cap[item["artist"]] += 1
             if len(final) >= request.size: break
@@ -177,9 +155,8 @@ async def recommend(request: RecommendRequest):
         return JSONResponse(content={"recommendations": final, "vibe": vibe})
 
     except Exception as e:
-        logging.error(f"Isolated Engine Error: {e}")
-        raise HTTPException(status_code=500, detail="Personalization failed.")
-
+        logging.error(f"Personalization Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/save-playlist")
 async def save_playlist(request: PlaylistSaveRequest):
@@ -188,11 +165,8 @@ async def save_playlist(request: PlaylistSaveRequest):
         user_id = sp.current_user()["id"]
         playlist = sp.user_playlist_create(user_id, request.name, public=False)
         track_uris = [f"spotify:track:{tid}" for tid in request.track_ids]
-
-        # Batch upload to avoid timeout
         for i in range(0, len(track_uris), 100):
             sp.playlist_add_items(playlist["id"], track_uris[i:i + 100])
-
         return {"status": "success", "url": playlist["external_urls"]["spotify"]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
