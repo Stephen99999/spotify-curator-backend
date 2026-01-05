@@ -387,10 +387,10 @@ async def recommend(request: RecommendRequest):
     day = datetime.datetime.utcnow().weekday()
 
     valid_context_artists = [
-            t['artists'][0]['id']
-            for t in context_pool
-            if t.get('artists') and t['artists'][0].get('id')
-        ]
+        t['artists'][0]['id']
+        for t in context_pool
+        if t.get('artists') and t['artists'][0].get('id')
+    ]
 
     artist_counts = Counter(valid_context_artists)
 
@@ -418,7 +418,7 @@ async def recommend(request: RecommendRequest):
 
     for t in candidate_pool:
         if not t.get('artists') or not t['artists'][0].get('id'):
-             continue
+            continue
 
         aid = t["artists"][0]["id"]
 
@@ -426,15 +426,15 @@ async def recommend(request: RecommendRequest):
         track_time_buckets = [now_bucket]
 
         rows.append(
-                extract_features(
-                    aid,
-                    day,
-                    now_bucket,
-                    artist_counts.get(aid, 0),
-                    user_time_buckets,
-                    track_time_buckets
-                )
+            extract_features(
+                aid,
+                day,
+                now_bucket,
+                artist_counts.get(aid, 0),
+                user_time_buckets,
+                track_time_buckets
             )
+        )
         meta.append({
             "id": t["id"],
             "name": t["name"],
@@ -492,7 +492,6 @@ async def recommend(request: RecommendRequest):
 
     logger.info(f"✓ Returning {len(final)} recommendations")
     return {"recommendations": final}
-
 
 
 # --- AUTH & SAVE ---
