@@ -31,7 +31,6 @@ class PlaylistSaveRequest(BaseModel):
 
 
 class RecommendRequest(BaseModel):
-    token: str = Field(..., min_length=10)
     size: int = Field(50, ge=1, le=100)
 
 
