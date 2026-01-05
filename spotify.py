@@ -5,28 +5,41 @@ import random
 import logging
 from collections import Counter
 from typing import List
-
+from threading import Lock
 import pandas as pd
 import spotipy
-from spotipy.oauth2 import SpotifyOAuth
-from spotipy import SpotifyException
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, RedirectResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from threading import Lock
 from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, RedirectResponse
+from pydantic import BaseModel, Field
+from spotipy.oauth2 import SpotifyOAuth
 
 load_dotenv()
 
-# --- APP CONFIG ---
+# --- CONFIG ---
+SCOPE = "user-read-private user-top-read user-read-recently-played playlist-modify-private"
+CLIENT_ID = os.getenv("CLIENT_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+REDIRECT_URI = os.getenv("REDIRECT_URI")
+
 app = FastAPI(title="Global Discovery API")
+
+# Enable CORS for your Vercel frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+# Initialize OAuth
+sp_oauth = SpotifyOAuth(
+    client_id=CLIENT_ID,
+    client_secret=CLIENT_SECRET,
+    redirect_uri=REDIRECT_URI,
+    scope=SCOPE
 )
 
 # --- MODELS ---
@@ -38,17 +51,14 @@ try:
 except Exception as e:
     print(f"❌ Model Load Error: {e}")
 
-
 class RecommendRequest(BaseModel):
     token: str = Field(..., min_length=10)
     size: int = Field(50, ge=1, le=100)
-
 
 class PlaylistSaveRequest(BaseModel):
     token: str
     track_ids: List[str]
     name: str = "My AI Discovery Mix"
-
 
 # --- VIBE & TIME LOGIC ---
 VIBE_MAP = {
@@ -58,21 +68,19 @@ VIBE_MAP = {
     "night": {"target_energy": 0.3, "target_valence": 0.3}
 }
 
-
 def get_time_bucket(hour: int) -> str:
     if hour < 5 or hour >= 22: return "night"
     if 5 <= hour < 12: return "morning"
     if 12 <= hour < 17: return "afternoon"
     return "evening"
 
-
 # --- CORE LOGIC: THE TASTE ENGINE ---
 def get_hybrid_history(sp):
-    """Captures Long Term (Core) + Short Term (Recent Shifts) + Recently Played."""
+    """Captures Long Term (Core) + Short Term (Lately) + Recently Played."""
     history = []
     seen = set()
 
-    # 1. Recently Played (Instant shift - last 50 tracks)
+    # 1. Recently Played (Instant shift)
     try:
         rp = sp.current_user_recently_played(limit=50)
         for item in rp['items']:
@@ -81,10 +89,9 @@ def get_hybrid_history(sp):
                 item['track']['_origin'] = 'recent'
                 history.append(item['track'])
                 seen.add(tid)
-    except:
-        pass
+    except: pass
 
-    # 2. Short Term (Last 4 weeks - The 'Current Era')
+    # 2. Short Term (Last 4 weeks)
     try:
         st = sp.current_user_top_tracks(limit=50, time_range='short_term')
         for t in st['items']:
@@ -92,10 +99,9 @@ def get_hybrid_history(sp):
                 t['_origin'] = 'short'
                 history.append(t)
                 seen.add(t['id'])
-    except:
-        pass
+    except: pass
 
-    # 3. Long Term (Core DNA - The 'Johnson' Anchor)
+    # 3. Long Term (Natural Anchor)
     try:
         lt = sp.current_user_top_tracks(limit=50, time_range='long_term')
         for t in lt['items']:
@@ -103,67 +109,74 @@ def get_hybrid_history(sp):
                 t['_origin'] = 'long'
                 history.append(t)
                 seen.add(t['id'])
-    except:
-        pass
+    except: pass
 
     return history
 
+# --- ROUTES ---
+
+@app.get("/login")
+def login():
+    """Initial step: Redirects user to Spotify Login."""
+    auth_url = sp_oauth.get_authorize_url()
+    return RedirectResponse(auth_url)
+
+@app.get("/callback")
+def callback(code: str):
+    """Second step: Spotify sends user here, we get token and send to Frontend."""
+    token_info = sp_oauth.get_access_token(code)
+    access_token = token_info['access_token']
+    # Redirect back to your Vercel URL
+    frontend_url = f"https://spotify-playlist-curator.vercel.app/home?token={access_token}"
+    return RedirectResponse(frontend_url)
 
 @app.post("/recommend")
 async def recommend(request: RecommendRequest):
+    """Third step: Frontend sends token here to get AI recommendations."""
     sp = spotipy.Spotify(auth=request.token)
 
     try:
         user = sp.current_user()
+        # DYNAMIC MARKET: Fetching from user profile for 100% accuracy
         market = user.get("country", "US")
         history = get_hybrid_history(sp)
 
         if not history:
-            raise HTTPException(status_code=400, detail="Not enough listening history.")
+            raise HTTPException(status_code=400, detail="Not enough history.")
 
-        # Extract User's Top Genres for strict filtering
+        # Genre Locking: Extract top 5 genres from user's actual history
         artist_ids = [t['artists'][0]['id'] for t in history[:50] if t.get('artists')]
         artists_data = sp.artists(artist_ids)['artists']
         genres = [g for a in artists_data for g in a.get('genres', [])]
         top_genres = [g for g, _ in Counter(genres).most_common(5)]
 
-        # Determine "Right Now" context
         now_hour = datetime.datetime.now().hour
         bucket = get_time_bucket(now_hour)
         day_of_week = datetime.datetime.now().weekday()
 
-        # Build Candidate Pool (Locked to User Genres + New Finds)
         candidates = []
         seen_cids = {t['id'] for t in history}
 
-        # Strategy: Search within top genres to prevent "Algorithm Leakage"
+        # Search within genres to stay relevant to user (no "Algorithm Leakage")
         for genre in top_genres:
-            # tag:new helps find fresh tracks in that specific genre
             q = f'genre:"{genre}"'
             results = sp.search(q=q, type='track', limit=40, market=market)
             for t in results['tracks']['items']:
                 if t['id'] not in seen_cids:
+                    # Map origin for scoring
+                    t['_origin'] = 'discovery'
                     candidates.append(t)
                     seen_cids.add(t['id'])
 
-        if not candidates:
-            # Fallback to general discovery if genre search is too narrow
-            results = sp.search(q="year:2024-2025", type='track', limit=50, market=market)
-            candidates.extend(results['tracks']['items'])
-
-        # --- ML SCORING ---
+        # ML SCORING
         rows = []
         meta = []
-        artist_play_counts = Counter([t['artists'][0]['id'] for t in history])
-
         for t in candidates:
-            aid = t['artists'][0]['id']
-            # Feature engineering for your specific .pkl models
             rows.append([
                 day_of_week,
-                float(t.get('popularity', 50)),  # artist_global_plays proxy
-                1.0 if t['_origin'] == 'recent' else 0.5 if t['_origin'] == 'short' else 0.2,  # user_affinity
-                1.0,  # track_context_weight
+                float(t.get('popularity', 50)),
+                0.5, # user_affinity baseline for discovery
+                1.0, # track_context_weight
                 1.0 if bucket == "afternoon" else 0.0,
                 1.0 if bucket == "evening" else 0.0,
                 1.0 if bucket == "night" else 0.0
@@ -191,16 +204,15 @@ async def recommend(request: RecommendRequest):
             meta[i]["score"] = float(score)
 
         final = sorted(meta, key=lambda x: x['score'], reverse=True)[:request.size]
-
         return JSONResponse(content={"recommendations": final})
 
     except Exception as e:
         logging.error(f"Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/save-playlist")
 async def save_playlist(request: PlaylistSaveRequest):
+    """Final step: Save selected tracks to user's library."""
     sp = spotipy.Spotify(auth=request.token)
     try:
         uid = sp.current_user()["id"]
