@@ -164,7 +164,7 @@ async def recommend(
     session.trust_env = False
 
     sp = spotipy.Spotify(
-        auth=request.token,
+        auth=token,
         requests_timeout=10,
         retries=2,
         requests_session=session
