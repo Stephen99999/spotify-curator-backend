@@ -88,63 +88,65 @@ def callback(code: str):
 
 @app.post("/recommend")
 async def recommend(request: RecommendRequest):
-    # LOCAL INSTANCE: This ensures User A never sees User B's data
     sp = spotipy.Spotify(auth=request.token)
-
     try:
-        # Identify current user's market (Nigeria, US, UK, etc.)
         user_info = sp.current_user()
         market = user_info.get("country", "US")
         vibe = get_time_bucket()
         day_of_week = datetime.datetime.now().weekday()
 
-        # 1. TASTE EXTRACTION (Short vs Mid Term)
-        # Short Term (Weight 1.0) - High Vibe impact
-        st = sp.current_user_top_tracks(limit=15, time_range='short_term')['items']
-        # Mid Term (Weight 0.5) - Core Anchor
-        mt = sp.current_user_top_tracks(limit=15, time_range='medium_term')['items']
+        # 1. INDEPENDENT SEED FETCHING
+        # Pull Short Term (Weight 1.0) and Mid Term (Weight 0.5)
+        st_data = sp.current_user_top_tracks(limit=15, time_range='short_term')['items']
+        mt_data = sp.current_user_top_tracks(limit=15, time_range='medium_term')['items']
 
-        if not st and not mt:
-            raise HTTPException(status_code=400, detail="New account? Listen to more music first!")
-
-        # 2. SEED SELECTION
         seeds = []
-        for t in st: seeds.append((t['artists'][0]['id'], 1.0))
-        for t in mt: seeds.append((t['artists'][0]['id'], 0.5))
+        for t in st_data: seeds.append((t['artists'][0], 1.0))
+        for t in mt_data: seeds.append((t['artists'][0], 0.5))
 
-        # Sort by weight and pick top 8 unique artist seeds
-        top_seeds = []
-        seen_seeds = set()
-        for a_id, weight in sorted(seeds, key=lambda x: x[1], reverse=True):
-            if a_id not in seen_seeds:
-                top_seeds.append((a_id, weight))
-                seen_seeds.add(a_id)
-            if len(top_seeds) >= 8: break
-
-        # 3. DISCOVERY POOL (Related Artist Scavenging)
         candidates = []
         seen_tracks = set()
 
-        for artist_id, weight in top_seeds:
-            # Get related artists (The "Niggas" who vibe similarly)
-            related = sp.artist_related_artists(artist_id)['artists'][:4]
-            for r_art in related:
-                # Avoid the most generic popular songs by skipping popularity > 90
-                rel_tracks = sp.artist_top_tracks(r_art['id'], country=market)['tracks']
-                for track in rel_tracks[:3]:
-                    if track['id'] not in seen_tracks:
-                        track['_vibe_affinity'] = weight
-                        candidates.append(track)
-                        seen_tracks.add(track['id'])
+        # 2. FAIL-SAFE DISCOVERY LOOP
+        # We iterate through each artist seed separately.
+        # If one seed hits a 404 or fails, we 'continue' to the next one.
+        for artist, weight in seeds[:10]:
+            try:
+                # STRATEGY: Instead of 'related_artists' (404 risk),
+                # we search for tracks in the same genres as the seed artist.
+                artist_details = sp.artist(artist['id'])
+                genres = artist_details.get('genres', [])
 
-        # 4. ML SCORING (The Personal Filter)
+                if not genres:
+                    continue
+
+                # Search for 'new' tracks in this specific user's genre
+                search_query = f'genre:"{genres[0]}"'
+                results = sp.search(q=search_query, type='track', limit=10, market=market)
+
+                for track in results['tracks']['items']:
+                    if track['id'] not in seen_tracks:
+                        # Logic check: Don't recommend the artist they already listen to
+                        if track['artists'][0]['id'] != artist['id']:
+                            track['_vibe_affinity'] = weight
+                            candidates.append(track)
+                            seen_tracks.add(track['id'])
+
+            except Exception as seed_err:
+                # Individual seed failed? Log it and move on. No crash.
+                logging.warning(f"Skipping seed {artist['name']}: {seed_err}")
+                continue
+
+        # 3. ML SCORING (Remains Private to this User's Request)
+        if not candidates:
+            return JSONResponse(status_code=404,
+                                content={"error": "Vibe pool empty. Try listening to more niche music."})
+
         rows, meta = [], []
         for t in candidates:
             rows.append([
-                day_of_week,
-                float(t.get('popularity', 50)),
-                t.get('_vibe_affinity', 0.5),
-                1.0,  # context weight
+                day_of_week, float(t.get('popularity', 50)),
+                t.get('_vibe_affinity', 0.5), 1.0,
                 1.0 if vibe == "afternoon" else 0.0,
                 1.0 if vibe == "evening" else 0.0,
                 1.0 if vibe == "night" else 0.0
@@ -169,18 +171,16 @@ async def recommend(request: RecommendRequest):
         for i, score in enumerate(scores):
             meta[i]["score"] = float(score)
 
-        # 5. FINAL RANKING
-        final = sorted(meta, key=lambda x: x['score'], reverse=True)[:request.size]
-
         return JSONResponse(content={
-            "recommendations": final,
+            "recommendations": sorted(meta, key=lambda x: x['score'], reverse=True)[:request.size],
             "vibe": vibe,
-            "user": user_info['display_name']
+            "session_user": user_info['display_name']
         })
 
     except Exception as e:
-        logging.error(f"Isolated Pipeline Error: {e}")
-        return JSONResponse(status_code=500, content={"error": "Recommendation failed"})
+        logging.error(f"FATAL PIPELINE ERROR: {e}")
+        return JSONResponse(status_code=500, content={"error": "System overload or API failure."})
+
 
 @app.post("/save-playlist")
 async def save_playlist(request: PlaylistSaveRequest):
