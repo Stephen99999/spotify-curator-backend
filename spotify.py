@@ -1,12 +1,10 @@
-import os
-import joblib
 import datetime
-import random
 import logging
-from collections import Counter
-from typing import List, Optional
+import os
 from threading import Lock
+from typing import List
 
+import joblib
 import pandas as pd
 import spotipy
 from dotenv import load_dotenv
@@ -24,16 +22,17 @@ CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 REDIRECT_URI = os.getenv("REDIRECT_URI")
 
-app = FastAPI(title="Universal Discovery API")
+app = FastAPI(title="Public Universal Discovery API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Update to ["https://spotify-playlist-curator.vercel.app"] for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Shared OAuth object (stateless)
 sp_oauth = SpotifyOAuth(
     client_id=CLIENT_ID,
     client_secret=CLIENT_SECRET,
@@ -41,17 +40,17 @@ sp_oauth = SpotifyOAuth(
     scope=SCOPE
 )
 
-# --- ML MODELS ---
+# ML MODELS (Loaded once, used as read-only by multiple threads)
 model_lock = Lock()
 try:
     model_xgb = joblib.load("discovery_xgb_finetuned.pkl")
     model_lgbm = joblib.load("discovery_lgbm_finetuned.pkl")
-    print("✅ Multi-User ML Models Loaded")
+    print("✅ ML Models Ready for Multi-User Traffic")
 except Exception as e:
-    print(f"❌ ML Model Error: {e}")
+    print(f"❌ Model Load Error: {e}")
 
 
-# --- MODELS ---
+# --- SCHEMAS ---
 class RecommendRequest(BaseModel):
     token: str = Field(..., min_length=10)
     size: int = Field(50, ge=1, le=100)
@@ -63,26 +62,13 @@ class PlaylistSaveRequest(BaseModel):
     name: str = "My AI Discovery Mix"
 
 
-# --- CORE UTILS ---
-
+# --- HELPER: NO GLOBAL LEAKAGE ---
 def get_time_bucket() -> str:
-    """Determine vibe context based on server time (can be adjusted for user local)."""
     hour = datetime.datetime.now().hour
     if hour < 5 or hour >= 22: return "night"
     if 5 <= hour < 12: return "morning"
     if 12 <= hour < 17: return "afternoon"
     return "evening"
-
-
-def get_user_top_genres(sp) -> List[str]:
-    """Dynamically extract the user's current genre fingerprint."""
-    try:
-        # Fetch top artists to get accurate genre tags
-        top_artists = sp.current_user_top_artists(limit=20, time_range='short_term')['items']
-        genres = [g for a in top_artists for g in a.get('genres', [])]
-        return [g for g, _ in Counter(genres).most_common(5)]
-    except Exception:
-        return ["pop", "chill"]  # Robust fallback
 
 
 # --- ROUTES ---
@@ -96,53 +82,69 @@ def login():
 def callback(code: str):
     token_info = sp_oauth.get_access_token(code)
     access_token = token_info['access_token']
-    frontend_url = f"https://spotify-playlist-curator.vercel.app/home?token={access_token}"
-    return RedirectResponse(frontend_url)
+    # Redirecting to Vercel with the private token
+    return RedirectResponse(f"https://spotify-playlist-curator.vercel.app/home?token={access_token}")
 
 
 @app.post("/recommend")
 async def recommend(request: RecommendRequest):
+    # LOCAL INSTANCE: This ensures User A never sees User B's data
     sp = spotipy.Spotify(auth=request.token)
+
     try:
-        user_profile = sp.current_user()
-        market = user_profile.get("country", "US")
-        top_genres = get_user_top_genres(sp)
+        # Identify current user's market (Nigeria, US, UK, etc.)
+        user_info = sp.current_user()
+        market = user_info.get("country", "US")
         vibe = get_time_bucket()
         day_of_week = datetime.datetime.now().weekday()
 
+        # 1. TASTE EXTRACTION (Short vs Mid Term)
+        # Short Term (Weight 1.0) - High Vibe impact
+        st = sp.current_user_top_tracks(limit=15, time_range='short_term')['items']
+        # Mid Term (Weight 0.5) - Core Anchor
+        mt = sp.current_user_top_tracks(limit=15, time_range='medium_term')['items']
+
+        if not st and not mt:
+            raise HTTPException(status_code=400, detail="New account? Listen to more music first!")
+
+        # 2. SEED SELECTION
+        seeds = []
+        for t in st: seeds.append((t['artists'][0]['id'], 1.0))
+        for t in mt: seeds.append((t['artists'][0]['id'], 0.5))
+
+        # Sort by weight and pick top 8 unique artist seeds
+        top_seeds = []
+        seen_seeds = set()
+        for a_id, weight in sorted(seeds, key=lambda x: x[1], reverse=True):
+            if a_id not in seen_seeds:
+                top_seeds.append((a_id, weight))
+                seen_seeds.add(a_id)
+            if len(top_seeds) >= 8: break
+
+        # 3. DISCOVERY POOL (Related Artist Scavenging)
         candidates = []
-        seen_ids = set()
+        seen_tracks = set()
 
-        # --- REFINED SEARCH WITH FALLBACKS ---
-        for genre in top_genres:
-            # Stage 1: Specific & New (The Gold Standard)
-            queries = [f'genre:"{genre}" tag:new', f'genre:"{genre}"']
+        for artist_id, weight in top_seeds:
+            # Get related artists (The "Niggas" who vibe similarly)
+            related = sp.artist_related_artists(artist_id)['artists'][:4]
+            for r_art in related:
+                # Avoid the most generic popular songs by skipping popularity > 90
+                rel_tracks = sp.artist_top_tracks(r_art['id'], country=market)['tracks']
+                for track in rel_tracks[:3]:
+                    if track['id'] not in seen_tracks:
+                        track['_vibe_affinity'] = weight
+                        candidates.append(track)
+                        seen_tracks.add(track['id'])
 
-            for q in queries:
-                results = sp.search(q=q, type='track', limit=40, market=market)
-                items = results['tracks']['items']
-
-                if items:
-                    for t in items:
-                        if t['id'] not in seen_ids:
-                            candidates.append(t)
-                            seen_ids.add(t['id'])
-                    break  # Stop if we found tracks for this genre
-
-        # Stage 2: Universal Fallback (If the user has ultra-niche taste)
-        if len(candidates) < 10:
-            fallback_res = sp.search(q='tag:new', type='track', limit=50, market=market)
-            candidates.extend(fallback_res['tracks']['items'])
-
-        # --- ML SCORING (Remains the same) ---
-        if not candidates:
-            raise HTTPException(status_code=404, detail="Spotify returned zero tracks for these filters.")
-
+        # 4. ML SCORING (The Personal Filter)
         rows, meta = [], []
         for t in candidates:
             rows.append([
-                day_of_week, float(t.get('popularity', 50)),
-                0.65, 1.0,
+                day_of_week,
+                float(t.get('popularity', 50)),
+                t.get('_vibe_affinity', 0.5),
+                1.0,  # context weight
                 1.0 if vibe == "afternoon" else 0.0,
                 1.0 if vibe == "evening" else 0.0,
                 1.0 if vibe == "night" else 0.0
@@ -167,16 +169,18 @@ async def recommend(request: RecommendRequest):
         for i, score in enumerate(scores):
             meta[i]["score"] = float(score)
 
+        # 5. FINAL RANKING
+        final = sorted(meta, key=lambda x: x['score'], reverse=True)[:request.size]
+
         return JSONResponse(content={
-            "recommendations": sorted(meta, key=lambda x: x['score'], reverse=True)[:request.size],
-            "vibe_detected": vibe
+            "recommendations": final,
+            "vibe": vibe,
+            "user": user_info['display_name']
         })
 
     except Exception as e:
-        logging.error(f"Pipeline Error: {str(e)}")
-        # Return a clean error instead of a 500 crash
-        return JSONResponse(status_code=500, content={"error": "Recommendation failed", "details": str(e)})
-
+        logging.error(f"Isolated Pipeline Error: {e}")
+        return JSONResponse(status_code=500, content={"error": "Recommendation failed"})
 
 @app.post("/save-playlist")
 async def save_playlist(request: PlaylistSaveRequest):
