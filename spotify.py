@@ -90,7 +90,7 @@ def is_valid_seed(track: dict) -> bool:
 
 # --- FEATURE HELPERS ---
 def get_time_bucket() -> str:
-    hour = datetime.datetime.now().hour
+    hour = datetime.datetime.utcnow().hour
     if hour < 5 or hour >= 22: return "night"
     if 5 <= hour < 12: return "morning"
     if 12 <= hour < 17: return "afternoon"
@@ -149,10 +149,6 @@ def get_clean_history(sp):
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("discovery_api")
-
-
-def is_spotify_id(s):
-    return isinstance(s, str) and len(s) in (22, 23)
 
 
 @app.post("/recommend")
@@ -217,8 +213,8 @@ async def recommend(request: RecommendRequest, req: Request):
     unique_artist_ids = list(set(seed_artist_ids))
     random.shuffle(unique_artist_ids)
 
-    logger.info(f"Fetching genre data from {min(20, len(unique_artist_ids))} artists...")
-    for aid in unique_artist_ids[:20]:
+    logger.info(f"Fetching genre data from {min(15, len(unique_artist_ids))} artists...")
+    for aid in unique_artist_ids[:15]:
         try:
             artist_info = sp.artist(aid)
             genres = artist_info.get('genres', [])
@@ -240,7 +236,7 @@ async def recommend(request: RecommendRequest, req: Request):
 
     # STRATEGY 1: Search by artists you know (75% of pool - familiar tracks)
     random.shuffle(artist_names)
-    search_artists = [a for a in artist_names if a][:20]
+    search_artists = [a for a in artist_names if a][:15]
     known_artists_set = set(search_artists)  # Artists from your history
 
     familiar_pool = []
