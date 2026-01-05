@@ -103,56 +103,56 @@ def callback(code: str):
 @app.post("/recommend")
 async def recommend(request: RecommendRequest):
     sp = spotipy.Spotify(auth=request.token)
-
     try:
-        # 1. Fetch User Profile for Market Accuracy
         user_profile = sp.current_user()
         market = user_profile.get("country", "US")
-
-        # 2. Extract Dynamic Seeds
         top_genres = get_user_top_genres(sp)
         vibe = get_time_bucket()
         day_of_week = datetime.datetime.now().weekday()
 
-        # 3. Breadcrumb Discovery (Avoids restricted Recommendations API)
         candidates = []
         seen_ids = set()
 
-        # We search specifically for 'new' tags in the user's favorite genres
+        # --- REFINED SEARCH WITH FALLBACKS ---
         for genre in top_genres:
-            query = f'genre:"{genre}" tag:new'
-            results = sp.search(q=query, type='track', limit=30, market=market)
-            for t in results['tracks']['items']:
-                if t['id'] not in seen_ids:
-                    candidates.append(t)
-                    seen_ids.add(t['id'])
+            # Stage 1: Specific & New (The Gold Standard)
+            queries = [f'genre:"{genre}" tag:new', f'genre:"{genre}"']
 
+            for q in queries:
+                results = sp.search(q=q, type='track', limit=40, market=market)
+                items = results['tracks']['items']
+
+                if items:
+                    for t in items:
+                        if t['id'] not in seen_ids:
+                            candidates.append(t)
+                            seen_ids.add(t['id'])
+                    break  # Stop if we found tracks for this genre
+
+        # Stage 2: Universal Fallback (If the user has ultra-niche taste)
+        if len(candidates) < 10:
+            fallback_res = sp.search(q='tag:new', type='track', limit=50, market=market)
+            candidates.extend(fallback_res['tracks']['items'])
+
+        # --- ML SCORING (Remains the same) ---
         if not candidates:
-            raise HTTPException(status_code=404, detail="Could not find new music for this taste.")
+            raise HTTPException(status_code=404, detail="Spotify returned zero tracks for these filters.")
 
-        # 4. ML SCORING LAYER
-        rows = []
-        meta = []
+        rows, meta = [], []
         for t in candidates:
-            # Preparing input for the Finetuned Models
             rows.append([
-                day_of_week,
-                float(t.get('popularity', 50)),
-                0.65,  # Base user affinity (since it's in their genre)
-                1.0,  # Track context weight
+                day_of_week, float(t.get('popularity', 50)),
+                0.65, 1.0,
                 1.0 if vibe == "afternoon" else 0.0,
                 1.0 if vibe == "evening" else 0.0,
                 1.0 if vibe == "night" else 0.0
             ])
             meta.append({
-                "id": t["id"],
-                "name": t["name"],
-                "artist": t["artists"][0]["name"],
+                "id": t["id"], "name": t["name"], "artist": t["artists"][0]["name"],
                 "url": t["external_urls"]["spotify"],
                 "albumArt": t["album"]["images"][0]["url"] if t["album"].get("images") else None
             })
 
-        # Convert to DataFrame for model prediction
         X = pd.DataFrame(rows, columns=[
             "day_of_week", "artist_global_plays", "user_affinity",
             "track_context_weight", "time_bucket_afternoon",
@@ -160,7 +160,6 @@ async def recommend(request: RecommendRequest):
         ])
 
         with model_lock:
-            # Ensemble prediction using your loaded .pkl files
             p1 = model_xgb.predict_proba(X)[:, 1]
             p2 = model_lgbm.predict_proba(X)[:, 1]
             scores = (p1 + p2) / 2
@@ -168,18 +167,15 @@ async def recommend(request: RecommendRequest):
         for i, score in enumerate(scores):
             meta[i]["score"] = float(score)
 
-        # 5. Rank and Slice
-        final_list = sorted(meta, key=lambda x: x['score'], reverse=True)[:request.size]
-
         return JSONResponse(content={
-            "recommendations": final_list,
-            "vibe_detected": vibe,
-            "genres_used": top_genres
+            "recommendations": sorted(meta, key=lambda x: x['score'], reverse=True)[:request.size],
+            "vibe_detected": vibe
         })
 
     except Exception as e:
-        logging.error(f"Error in recommendation pipeline: {e}")
-        raise HTTPException(status_code=500, detail="Internal processing error.")
+        logging.error(f"Pipeline Error: {str(e)}")
+        # Return a clean error instead of a 500 crash
+        return JSONResponse(status_code=500, content={"error": "Recommendation failed", "details": str(e)})
 
 
 @app.post("/save-playlist")
