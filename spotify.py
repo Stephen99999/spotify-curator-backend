@@ -154,6 +154,10 @@ def is_spotify_id(s):
 
 @app.post("/recommend")
 async def recommend(request: RecommendRequest):
+    """
+    Recommendation system using ONLY non-deprecated Spotify API endpoints.
+    No /recommendations, /audio-features, or /related-artists used.
+    """
     if not model_xgb:
         raise HTTPException(status_code=500, detail="Models not active")
 
@@ -237,7 +241,8 @@ async def recommend(request: RecommendRequest):
 
     # STRATEGY 1: Search by artists you know (75% of pool - familiar tracks)
     random.shuffle(artist_names)
-    search_artists = [a for a in artist_names if a][:20]
+    # Use more artists for better personalization
+    search_artists = [a for a in artist_names if a][:30]  # Increased from 20 to 30
     known_artists_set = set(search_artists)  # Artists from your history
 
     familiar_pool = []
@@ -382,33 +387,54 @@ async def recommend(request: RecommendRequest):
     day = datetime.datetime.utcnow().weekday()
 
     valid_context_artists = [
-        t['artists'][0]['id']
-        for t in context_pool
-        if t.get('artists') and t['artists'][0].get('id')
-    ]
+            t['artists'][0]['id']
+            for t in context_pool
+            if t.get('artists') and t['artists'][0].get('id')
+        ]
 
     artist_counts = Counter(valid_context_artists)
-    user_time_buckets = [now_bucket]
+
+    # Extract user's actual listening time patterns from history
+    user_time_buckets = []
+    for track in context_pool:
+        played_at = track.get('played_at')
+        if played_at:
+            try:
+                # Parse ISO timestamp and extract hour
+                play_time = datetime.datetime.fromisoformat(played_at.replace('Z', '+00:00'))
+                play_hour = play_time.hour
+                user_time_buckets.append(get_time_bucket(play_hour))
+            except:
+                pass
+
+        # Fallback to current time if no history available
+    if not user_time_buckets:
+        user_time_buckets = [now_bucket]
+
+    logger.info(f"User listening pattern: {Counter(user_time_buckets).most_common()}")
 
     meta = []
     rows = []
 
     for t in candidate_pool:
         if not t.get('artists') or not t['artists'][0].get('id'):
-            continue
+             continue
 
         aid = t["artists"][0]["id"]
-        rows.append(
-            extract_features(
-                aid,
-                day,
-                now_bucket,
-                artist_counts.get(aid, 0),
-                user_time_buckets,
-                [now_bucket]
-            )
-        )
 
+        # For each track, use the current time bucket as track context
+        track_time_buckets = [now_bucket]
+
+        rows.append(
+                extract_features(
+                    aid,
+                    day,
+                    now_bucket,
+                    artist_counts.get(aid, 0),
+                    user_time_buckets,
+                    track_time_buckets
+                )
+            )
         meta.append({
             "id": t["id"],
             "name": t["name"],
