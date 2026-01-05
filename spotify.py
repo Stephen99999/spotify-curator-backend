@@ -3,7 +3,7 @@ import logging
 import os
 from threading import Lock
 from typing import List
-
+from collections import Counter
 import joblib
 import pandas as pd
 import spotipy
@@ -90,63 +90,57 @@ def callback(code: str):
 async def recommend(request: RecommendRequest):
     sp = spotipy.Spotify(auth=request.token)
     try:
-        user_info = sp.current_user()
-        market = user_info.get("country", "US")
-        vibe = get_time_bucket()
-        day_of_week = datetime.datetime.now().weekday()
+        # 1. PROFILE FINGERPRINTING
+        user = sp.current_user()
+        market = user.get("country", "US")
 
-        # 1. INDEPENDENT SEED FETCHING
-        # Pull Short Term (Weight 1.0) and Mid Term (Weight 0.5)
-        st_data = sp.current_user_top_tracks(limit=15, time_range='short_term')['items']
-        mt_data = sp.current_user_top_tracks(limit=15, time_range='medium_term')['items']
+        # Pull Short Term (Current Vibes) vs Medium Term (Actual Style)
+        st_tracks = sp.current_user_top_tracks(limit=50, time_range='short_term')['items']
+        mt_tracks = sp.current_user_top_tracks(limit=50, time_range='medium_term')['items']
 
-        seeds = []
-        for t in st_data: seeds.append((t['artists'][0], 1.0))
-        for t in mt_data: seeds.append((t['artists'][0], 0.5))
+        # 2. SEED WEIGHTING (Isolation of Style)
+        # We don't just use genres; we use specific Artist IDs to find "Sonic Cousins"
+        style_seeds = []
+        # Short term artists get 2x weight because they define the current "vibe"
+        for t in st_tracks: style_seeds.append((t['artists'][0]['id'], 1.0))
+        for t in mt_tracks: style_seeds.append((t['artists'][0]['id'], 0.5))
 
-        candidates = []
-        seen_tracks = set()
+        # Get unique top artists for this specific user
+        artist_counts = Counter([s[0] for s in style_seeds])
+        top_style_artists = [a for a, _ in artist_counts.most_common(10)]
 
-        # 2. FAIL-SAFE DISCOVERY LOOP
-        # We iterate through each artist seed separately.
-        # If one seed hits a 404 or fails, we 'continue' to the next one.
-        for artist, weight in seeds[:10]:
+        # 3. SCAVENGING THE CANDIDATE POOL
+        candidate_pool = []
+        seen_ids = set([t['id'] for t in st_tracks] + [t['id'] for t in mt_tracks])
+
+        for artist_id in top_style_artists:
             try:
-                # STRATEGY: Instead of 'related_artists' (404 risk),
-                # we search for tracks in the same genres as the seed artist.
-                artist_details = sp.artist(artist['id'])
-                genres = artist_details.get('genres', [])
-
-                if not genres:
-                    continue
-
-                # Search for 'new' tracks in this specific user's genre
-                search_query = f'genre:"{genres[0]}"'
-                results = sp.search(q=search_query, type='track', limit=10, market=market)
-
-                for track in results['tracks']['items']:
-                    if track['id'] not in seen_tracks:
-                        # Logic check: Don't recommend the artist they already listen to
-                        if track['artists'][0]['id'] != artist['id']:
-                            track['_vibe_affinity'] = weight
-                            candidates.append(track)
-                            seen_tracks.add(track['id'])
-
-            except Exception as seed_err:
-                # Individual seed failed? Log it and move on. No crash.
-                logging.warning(f"Skipping seed {artist['name']}: {seed_err}")
+                # Get Related Artists - This is the key to non-generic discovery
+                # It finds what fans of YOUR favorite artist also like
+                related = sp.artist_related_artists(artist_id)['artists'][:5]
+                for r_art in related:
+                    # Get their top tracks (The "Hidden Gems" of that style)
+                    r_tracks = sp.artist_top_tracks(r_art['id'], country=market)['tracks'][:3]
+                    for rt in r_tracks:
+                        if rt['id'] not in seen_ids:
+                            # Attach custom affinity for the ML model
+                            rt['_user_affinity'] = artist_counts[artist_id] / 10.0
+                            candidate_pool.append(rt)
+                            seen_ids.add(rt['id'])
+            except:
                 continue
 
-        # 3. ML SCORING (Remains Private to this User's Request)
-        if not candidates:
-            return JSONResponse(status_code=404,
-                                content={"error": "Vibe pool empty. Try listening to more niche music."})
-
+        # 4. ML SCORING (The Personal Bouncer)
+        vibe = get_time_bucket()
+        day = datetime.datetime.now().weekday()
         rows, meta = [], []
-        for t in candidates:
+
+        for t in candidate_pool:
             rows.append([
-                day_of_week, float(t.get('popularity', 50)),
-                t.get('_vibe_affinity', 0.5), 1.0,
+                day,
+                float(t.get('popularity', 50)),
+                t.get('_user_affinity', 0.5),  # User-specific style weight
+                1.0,  # context weight
                 1.0 if vibe == "afternoon" else 0.0,
                 1.0 if vibe == "evening" else 0.0,
                 1.0 if vibe == "night" else 0.0
@@ -171,15 +165,20 @@ async def recommend(request: RecommendRequest):
         for i, score in enumerate(scores):
             meta[i]["score"] = float(score)
 
-        return JSONResponse(content={
-            "recommendations": sorted(meta, key=lambda x: x['score'], reverse=True)[:request.size],
-            "vibe": vibe,
-            "session_user": user_info['display_name']
-        })
+        # 5. DIVERSITY FILTER (No more than 3 tracks per artist)
+        final = []
+        artist_cap = Counter()
+        for item in sorted(meta, key=lambda x: x['score'], reverse=True):
+            if artist_cap[item["artist"]] < 4:
+                final.append(item)
+                artist_cap[item["artist"]] += 1
+            if len(final) >= request.size: break
+
+        return JSONResponse(content={"recommendations": final, "vibe": vibe})
 
     except Exception as e:
-        logging.error(f"FATAL PIPELINE ERROR: {e}")
-        return JSONResponse(status_code=500, content={"error": "System overload or API failure."})
+        logging.error(f"Isolated Engine Error: {e}")
+        raise HTTPException(status_code=500, detail="Personalization failed.")
 
 
 @app.post("/save-playlist")
