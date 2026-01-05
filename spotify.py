@@ -15,8 +15,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from threading import Lock
 from dotenv import load_dotenv
 from fastapi.responses import JSONResponse
-from fastapi import Request
+from fastapi import Header
 import logging
+from urllib.parse import urlencode
 from spotipy import SpotifyException
 
 load_dotenv()
@@ -152,7 +153,11 @@ logger = logging.getLogger("discovery_api")
 
 
 @app.post("/recommend")
-async def recommend(request: RecommendRequest, req: Request):
+async def recommend(
+    request: RecommendRequest,
+    authorization: str = Header(...)
+):
+    token = authorization.replace("Bearer ", "")
     if not model_xgb:
         raise HTTPException(status_code=500, detail="Models not active")
 
@@ -480,13 +485,35 @@ async def recommend(request: RecommendRequest, req: Request):
 # --- AUTH & SAVE ---
 @app.get("/login")
 def login():
-    return RedirectResponse(sp_oauth.get_authorize_url())
+    params = {
+        "client_id": CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": REDIRECT_URI,
+        "scope": SCOPE,
+        "state": os.urandom(16).hex()
+    }
+    return RedirectResponse(
+        f"https://accounts.spotify.com/authorize?{urlencode(params)}"
+    )
 
 
 @app.get("/callback")
 def callback(code: str):
-    token = sp_oauth.get_access_token(code)
-    return RedirectResponse(f"https://spotify-playlist-curator.vercel.app/home?token={token['access_token']}")
+    response = requests.post(
+        "https://accounts.spotify.com/api/token",
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": REDIRECT_URI,
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    token = response.json()["access_token"]
+    return RedirectResponse(
+        f"https://spotify-playlist-curator.vercel.app/home?token={token}"
+    )
 
 
 @app.post("/save-playlist")
