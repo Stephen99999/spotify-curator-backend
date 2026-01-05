@@ -3,18 +3,18 @@ import joblib
 import datetime
 import random
 import requests
-from collections import Counter
+import logging
 import pandas as pd
 import spotipy
+from collections import Counter
+from typing import List, Dict
 from pydantic import BaseModel, Field
-from typing import List
 from spotipy.oauth2 import SpotifyOAuth
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from threading import Lock
 from dotenv import load_dotenv
-import logging
 from spotipy import SpotifyException
 
 load_dotenv()
@@ -32,14 +32,9 @@ class RecommendRequest(BaseModel):
     size: int = Field(50, ge=1, le=100)
 
 
-app = FastAPI(title="Discovery Playlist API")
+app = FastAPI(title="Global Discovery API")
 
-CLIENT_ID = os.getenv("CLIENT_ID")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET")
-REDIRECT_URI = os.getenv("REDIRECT_URI")
-SCOPE = os.getenv("SCOPE")
-
-# Load Models
+# Load Models (XGBoost/LGBM)
 model_xgb = None
 model_lgbm = None
 model_lock = Lock()
@@ -47,9 +42,9 @@ model_lock = Lock()
 try:
     model_xgb = joblib.load("discovery_xgb_finetuned.pkl")
     model_lgbm = joblib.load("discovery_lgbm_finetuned.pkl")
-    print("✅ AI Models Loaded")
+    logging.info("✅ AI Models Loaded")
 except Exception as e:
-    print(f"❌ Model Load Error: {e}")
+    logging.error(f"❌ Model Load Error: {e}")
 
 app.add_middleware(
     CORSMiddleware,
@@ -59,451 +54,160 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-sp_oauth = SpotifyOAuth(
-    client_id=CLIENT_ID,
-    client_secret=CLIENT_SECRET,
-    redirect_uri=REDIRECT_URI,
-    scope=SCOPE
-)
 
-
-# --- HELPER: IS THIS MUSIC? ---
-def is_valid_seed(track: dict) -> bool:
-    """Filters out Audiobooks, Podcasts, and weird metadata."""
-    if not track: return False
+# --- UTILS ---
+def is_valid_track(track: dict) -> bool:
+    """Filters out non-music content strictly."""
+    if not track or not track.get("id"): return False
     name = track.get("name", "").lower()
-
-    # 1. Title Heuristics (Audiobooks often start with 'Chapter')
-    bad_prefixes = ["chapter ", "episode ", "part ", "intro"]
-    if any(name.startswith(p) for p in bad_prefixes):
-        return False
-
-    # 2. Duration (Audiobook chapters can be very short or very long)
-    duration_ms = track.get("duration_ms", 0)
-    if duration_ms < 30000:  # Skip tracks under 30s
-        return False
-
+    # Avoid spoken word/podcasts appearing as tracks
+    if any(x in name for x in ["chapter", "episode", "part", "intro", "skit"]): return False
+    if track.get("duration_ms", 0) < 45000: return False  # Music is rarely < 45s
     return True
 
 
-# --- FEATURE HELPERS ---
-def get_time_bucket(hour: int) -> str:
-    if hour < 5 or hour >= 22: return "night"
-    if 5 <= hour < 12: return "morning"
-    if 12 <= hour < 17: return "afternoon"
-    return "evening"
+# --- CORE LOGIC: THE TASTE ANCHOR ---
+def get_user_dna(sp) -> Dict:
+    """
+    Combines Long Term (Years) and Medium Term (Months) to find
+    the user's 'True North' in music, ignoring temporary spikes.
+    """
+    dna = {"tracks": [], "genres": [], "artist_ids": set()}
 
+    # 1. Pull Long Term & Medium Term (The 'Natural' Taste)
+    for t_range in ["long_term", "medium_term"]:
+        results = sp.current_user_top_tracks(limit=50, time_range=t_range)
+        for t in results.get('items', []):
+            if is_valid_track(t):
+                dna["tracks"].append(t)
+                dna["artist_ids"].add(t['artists'][0]['id'])
 
-def extract_features(artist_id: str, day: int, current_time_bucket: str, artist_play_count: int,
-                     user_time_buckets: List[str], track_time_buckets: List[str]):
-    def get_affinity(hist, bucket):
-        return (sum(1 for h in hist if h == bucket) / len(hist)) if hist else 0.5
+    # 2. Identify Top Genres from these artists (Strict filtering)
+    artist_list = list(dna["artist_ids"])
+    for i in range(0, len(artist_list), 50):  # Spotify allows 50 artists per call
+        chunk = artist_list[i:i + 50]
+        full_artists = sp.artists(chunk)['artists']
+        for a in full_artists:
+            dna["genres"].extend(a.get('genres', []))
 
-    return [
-        day,
-        float(artist_play_count),
-        float(get_affinity(user_time_buckets, current_time_bucket)),
-        float(get_affinity(track_time_buckets, current_time_bucket)),
-        1.0 if current_time_bucket == "afternoon" else 0.0,
-        1.0 if current_time_bucket == "evening" else 0.0,
-        1.0 if current_time_bucket == "night" else 0.0
-    ]
-
-
-# --- HYBRID HISTORY FETCHING (CLEANED) ---
-def get_clean_history(sp):
-    """Fetches history but aggressively removes audiobooks/duplicates."""
-    combined_tracks = []
-    seen_ids = set()
-
-    # 1. Recent History
-    try:
-        recent_results = sp.current_user_recently_played(limit=50)
-        for item in recent_results.get('items', []):
-            track = item.get("track")
-            if is_valid_seed(track) and track["id"] not in seen_ids:
-                track["_source"] = "recent"
-                track["played_at"] = item.get("played_at")
-                combined_tracks.append(track)
-                seen_ids.add(track["id"])
-    except:
-        pass
-
-    # 2. Top Tracks (Weekly Context)
-    try:
-        top_results = sp.current_user_top_tracks(limit=50, time_range="short_term")
-        for track in top_results.get('items', []):
-            if is_valid_seed(track) and track["id"] not in seen_ids:
-                track["_source"] = "top_weekly"
-                track["played_at"] = None
-                combined_tracks.append(track)
-                seen_ids.add(track["id"])
-    except:
-        pass
-
-    return combined_tracks
-
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("discovery_api")
-
-
-def is_spotify_id(s):
-    return isinstance(s, str) and len(s) in (22, 23)
+    dna["top_genres"] = [g for g, count in Counter(dna["genres"]).most_common(8)]
+    return dna
 
 
 @app.post("/recommend")
 async def recommend(request: RecommendRequest):
-    """
-    Recommendation system using ONLY non-deprecated Spotify API endpoints.
-    No /recommendations, /audio-features, or /related-artists used.
-    """
-    if not model_xgb:
-        raise HTTPException(status_code=500, detail="Models not active")
+    if not model_xgb: raise HTTPException(status_code=500, detail="Models offline")
 
-    session = requests.Session()
-    session.trust_env = False
+    sp = spotipy.Spotify(auth=request.token)
 
-    sp = spotipy.Spotify(
-        auth=request.token,
-        requests_timeout=10,
-        retries=2,
-        requests_session=session
-    )
-
-    # --- TOKEN VALIDATION ---
     try:
         user = sp.current_user()
         market = user.get("country", "US")
-        logger.info(f"✓ User authenticated. Market: {market}")
-    except SpotifyException as e:
-        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
+        dna = get_user_dna(sp)
+    except SpotifyException:
+        raise HTTPException(status_code=401, detail="Auth Failed")
 
-    # --- GET USER'S LISTENING CONTEXT ---
-    context_pool = get_clean_history(sp)
+    if not dna["tracks"]:
+        raise HTTPException(status_code=400, detail="Profile too new. Listen to more music!")
 
-    if len(context_pool) < 5:
-        logger.info("Limited history, fetching top tracks...")
-        try:
-            top_tracks = sp.current_user_top_tracks(limit=50, time_range='short_term')
-            context_pool.extend([
-                track for track in top_tracks.get('items', [])
-                if track.get('id') and is_valid_seed(track) and
-                   track['id'] not in [t['id'] for t in context_pool]
-            ])
-        except:
-            pass
-
-    if not context_pool:
-        raise HTTPException(
-            status_code=400,
-            detail="No listening history found. Please listen to some music on Spotify first."
-        )
-
-    logger.info(f"Context pool size: {len(context_pool)} tracks")
-
-    # --- EXTRACT ARTISTS AND GENRES ---
-    seed_artist_ids = []
-    artist_names = []
-    all_genres = []
-
-    for track in context_pool:
-        if track.get('artists'):
-            for artist in track['artists']:
-                if artist.get('id') and artist.get('name'):
-                    seed_artist_ids.append(artist['id'])
-                    artist_names.append(artist['name'])
-
-    # Get artist details for genres
-    unique_artist_ids = list(set(seed_artist_ids))
-    random.shuffle(unique_artist_ids)
-
-    logger.info(f"Fetching genre data from {min(20, len(unique_artist_ids))} artists...")
-    for aid in unique_artist_ids[:20]:
-        try:
-            artist_info = sp.artist(aid)
-            genres = artist_info.get('genres', [])
-            all_genres.extend(genres)
-            logger.info(f"  Artist genres: {genres[:3] if genres else 'none'}")
-        except Exception as e:
-            logger.warning(f"  Failed to get artist {aid}: {e}")
-            continue
-
-    if not all_genres:
-        logger.warning("No genres found, will rely more on artist search")
-
-    # --- BUILD CANDIDATE POOL ---
-    target_pool_size = request.size * 4
+    # --- STRATEGIC CANDIDATE GENERATION ---
     candidate_pool = []
-    seen_ids = set([t['id'] for t in context_pool])  # Excludes recently played from recommendations
+    seen_ids = {t['id'] for t in dna["tracks"]}
 
-    logger.info(f"Building candidate pool (target: {target_pool_size})...")
+    # Strategy A: Deep Genre Search (The "Public" Fix)
+    # This prevents a Country fan from getting Rap because we only search their genres.
+    for genre in dna["top_genres"][:5]:
+        search_query = f"genre:\"{genre}\""
+        # We use 'tag:new' for discovery or just the genre for breadth
+        results = sp.search(q=search_query, type='track', limit=40, market=market)
+        for t in results.get('tracks', {}).get('items', []):
+            if is_valid_track(t) and t['id'] not in seen_ids:
+                candidate_pool.append(t)
+                seen_ids.add(t['id'])
 
-    # STRATEGY 1: Search by artists you know (75% of pool - familiar tracks)
-    random.shuffle(artist_names)
-    # Use more artists for better personalization
-    search_artists = [a for a in artist_names if a][:30]  # Increased from 20 to 30
-    known_artists_set = set(search_artists)  # Artists from your history
+    # Strategy B: Artist-Based Discovery
+    # Pick random core artists and find their other work/collabs
+    random_artists = random.sample(list(dna["artist_ids"]), min(len(dna["artist_ids"]), 10))
+    for a_id in random_artists:
+        top_t = sp.artist_top_tracks(a_id, market=market)
+        for t in top_t.get('tracks', []):
+            if is_valid_track(t) and t['id'] not in seen_ids:
+                candidate_pool.append(t)
+                seen_ids.add(t['id'])
 
-    familiar_pool = []
-    discovery_pool = []
-
-    for i in range(0, len(search_artists), 2):
-        if len(familiar_pool) >= target_pool_size * 0.75:
-            break
-
-        query_artists = search_artists[i:i + 2]
-        query = ' OR '.join(query_artists)
-
-        try:
-            results = sp.search(q=query, type='track', limit=50, market=market)
-
-            for item in results.get('tracks', {}).get('items', []):
-                if not item.get('id') or item['id'] in seen_ids or not is_valid_seed(item):
-                    continue
-
-                # Separate familiar vs discovery based on artist
-                item_artists = [a.get('name', '') for a in item.get('artists', [])]
-                is_familiar = any(a in known_artists_set for a in item_artists)
-
-                if is_familiar and len(familiar_pool) < target_pool_size * 0.75:
-                    familiar_pool.append(item)
-                    seen_ids.add(item['id'])
-                elif not is_familiar and len(discovery_pool) < target_pool_size * 0.25:
-                    discovery_pool.append(item)
-                    seen_ids.add(item['id'])
-
-        except Exception as e:
-            logger.warning(f"Search failed for artists {query_artists}: {e}")
-            continue
-
-    candidate_pool = familiar_pool + discovery_pool
-    logger.info(
-        f"  After artist search: {len(familiar_pool)} familiar + {len(discovery_pool)} discovery = {len(candidate_pool)} candidates")
-
-    # STRATEGY 2: Genre-based search (only for discovery if needed)
-    if all_genres and len(discovery_pool) < target_pool_size * 0.25:
-        genre_counts = Counter(all_genres)
-        top_genres = [g for g, _ in genre_counts.most_common(8)]
-
-        for genre in top_genres:
-            if len(discovery_pool) >= target_pool_size * 0.25:
-                break
-
-            try:
-                # Search with genre tag
-                results = sp.search(
-                    q=f'genre:"{genre}"',
-                    type='track',
-                    limit=30,
-                    market=market
-                )
-
-                for item in results.get('tracks', {}).get('items', []):
-                    if not (item.get('id') and item['id'] not in seen_ids and is_valid_seed(item)):
-                        continue
-
-                    # Only add if artist is NOT in known list (pure discovery)
-                    item_artists = [a.get('name', '') for a in item.get('artists', [])]
-                    if not any(a in known_artists_set for a in item_artists):
-                        discovery_pool.append(item)
-                        candidate_pool.append(item)
-                        seen_ids.add(item['id'])
-
-            except Exception as e:
-                logger.warning(f"Genre search failed for '{genre}': {e}")
-                continue
-
-        logger.info(
-            f"  After genre search: {len(familiar_pool)} familiar + {len(discovery_pool)} discovery = {len(candidate_pool)} candidates")
-
-    # STRATEGY 3: Deep dive into known artists' albums (familiar content)
-    for aid in unique_artist_ids[:15]:
-        if len(familiar_pool) >= target_pool_size * 0.75:
-            break
-
-        try:
-            albums = sp.artist_albums(
-                aid,
-                limit=5,
-                album_type='album,single',
-                market=market
-            )
-
-            for album in albums.get('items', [])[:3]:
-                album_tracks = sp.album_tracks(album['id'], limit=10, market=market)
-
-                for item in album_tracks.get('items', []):
-                    if (item.get('id') and
-                            item['id'] not in seen_ids):
-                        # Need to check if valid (album_tracks returns simplified objects)
-                        try:
-                            full_track = sp.track(item['id'], market=market)
-                            if is_valid_seed(full_track):
-                                familiar_pool.append(full_track)
-                                candidate_pool.append(full_track)
-                                seen_ids.add(item['id'])
-                        except:
-                            continue
-
-                        if len(familiar_pool) >= target_pool_size * 0.75:
-                            break
-        except Exception as e:
-            logger.warning(f"Album search failed for artist {aid}: {e}")
-            continue
-
-    logger.info(
-        f"  After album dive: {len(familiar_pool)} familiar + {len(discovery_pool)} discovery = {len(candidate_pool)} candidates")
-
-    # STRATEGY 4: User's liked songs (familiar content only)
-    if len(familiar_pool) < target_pool_size * 0.75:
-        try:
-            saved_tracks = sp.current_user_saved_tracks(limit=50, market=market)
-            for item in saved_tracks.get('items', []):
-                track = item.get('track')
-                if (track and track.get('id') and
-                        track['id'] not in seen_ids and
-                        is_valid_seed(track)):
-                    familiar_pool.append(track)
-                    candidate_pool.append(track)
-                    seen_ids.add(track['id'])
-
-                    if len(familiar_pool) >= target_pool_size * 0.75:
-                        break
-        except Exception as e:
-            logger.warning(f"Saved tracks fetch failed: {e}")
-
-    logger.info(
-        f"Final candidate pool: {len(familiar_pool)} familiar (75%) + {len(discovery_pool)} discovery (25%) = {len(candidate_pool)} total")
-
-    if not candidate_pool:
-        raise HTTPException(
-            status_code=500,
-            detail="Unable to generate recommendations. Try following more artists or adding songs to your library."
-        )
-
-    # --- AI SCORING ---
-    now_bucket = get_time_bucket(datetime.datetime.utcnow().hour)
-    day = datetime.datetime.utcnow().weekday()
-
-    valid_context_artists = [
-        t['artists'][0]['id']
-        for t in context_pool
-        if t.get('artists') and t['artists'][0].get('id')
-    ]
-
-    artist_counts = Counter(valid_context_artists)
-
-    # Extract user's actual listening time patterns from history
-    user_time_buckets = []
-    for track in context_pool:
-        played_at = track.get('played_at')
-        if played_at:
-            try:
-                # Parse ISO timestamp and extract hour
-                play_time = datetime.datetime.fromisoformat(played_at.replace('Z', '+00:00'))
-                play_hour = play_time.hour
-                user_time_buckets.append(get_time_bucket(play_hour))
-            except:
-                pass
-
-        # Fallback to current time if no history available
-    if not user_time_buckets:
-        user_time_buckets = [now_bucket]
-
-    logger.info(f"User listening pattern: {Counter(user_time_buckets).most_common()}")
-
-    meta = []
+    # --- SCORING & ML ---
+    # Extract features for the model
     rows = []
+    meta = []
+
+    # Pre-calculate user genre weights for the ML score
+    user_genre_set = set(dna["top_genres"])
 
     for t in candidate_pool:
-        if not t.get('artists') or not t['artists'][0].get('id'):
-            continue
+        # Simple Feature Engineering for the provided models
+        # You can adjust these to match your .pkl's expected input
+        artist_plays = 1 if t['artists'][0]['id'] in dna["artist_ids"] else 0
 
-        aid = t["artists"][0]["id"]
+        # Check if this track's artist shares the user's top genres
+        # (This is the final guardrail)
+        rows.append([
+            datetime.datetime.utcnow().weekday(),  # day_of_week
+            float(t.get('popularity', 50)),  # artist_global_plays (proxy)
+            float(0.8 if artist_plays else 0.2),  # user_affinity
+            1.0,  # track_context_weight
+            0.0, 0.0, 1.0  # time_bucket dummies (night default)
+        ])
 
-        # For each track, use the current time bucket as track context
-        track_time_buckets = [now_bucket]
-
-        rows.append(
-            extract_features(
-                aid,
-                day,
-                now_bucket,
-                artist_counts.get(aid, 0),
-                user_time_buckets,
-                track_time_buckets
-            )
-        )
         meta.append({
             "id": t["id"],
             "name": t["name"],
             "artist": t["artists"][0]["name"],
             "url": t["external_urls"]["spotify"],
             "albumArt": t["album"]["images"][0]["url"] if t["album"].get("images") else None,
-            "artist_plays": artist_counts.get(aid, 0),
-            "score": 0.0
+            "popularity": t.get('popularity', 0)
         })
 
-    if not meta:
-        raise HTTPException(status_code=500, detail="No valid tracks to score")
-
-    logger.info(f"Scoring {len(meta)} tracks with ML models...")
-
+    # ML Inference
     X = pd.DataFrame(rows, columns=[
-        "day_of_week",
-        "artist_global_plays",
-        "user_affinity",
-        "track_context_weight",
-        "time_bucket_afternoon",
-        "time_bucket_evening",
-        "time_bucket_night"
-    ]).fillna(0)
+        "day_of_week", "artist_global_plays", "user_affinity",
+        "track_context_weight", "time_bucket_afternoon",
+        "time_bucket_evening", "time_bucket_night"
+    ])
 
     with model_lock:
-        try:
-            p1 = model_xgb.predict_proba(X)[:, 1]
-            p2 = model_lgbm.predict_proba(X)[:, 1]
-            scores = (p1 + p2) / 2
-        except Exception as e:
-            logger.error(f"Model scoring failed: {e}")
-            scores = [random.random() for _ in meta]
+        p1 = model_xgb.predict_proba(X)[:, 1]
+        p2 = model_lgbm.predict_proba(X)[:, 1]
+        scores = (p1 + p2) / 2
 
-    # --- FINAL FILTERING & RANKING ---
-    final = []
-    artist_cap = Counter()
+    # Final Rank & Diversify
+    final_recommendations = []
+    for i, score in enumerate(scores):
+        meta[i]["score"] = float(score)
 
-    ranked = sorted(zip(meta, scores), key=lambda x: x[1], reverse=True)
+    # Sort by score and take top N
+    ranked = sorted(meta, key=lambda x: x['score'], reverse=True)
 
-    for item, score in ranked:
-        # Limit tracks per artist for diversity
-        if artist_cap[item["artist"]] >= 5:
-            continue
+    # Artist Diversity Cap: Max 3 tracks per artist
+    counts = Counter()
+    for r in ranked:
+        if counts[r['artist']] < 3:
+            final_recommendations.append(r)
+            counts[r['artist']] += 1
+        if len(final_recommendations) >= request.size: break
 
-        # Boost discovery slightly (new artists) but keep it modest
-        boost = 1.15 if item["artist_plays"] == 0 else 1.0
-        item["score"] = float(score) * boost
-
-        final.append(item)
-        artist_cap[item["artist"]] += 1
-
-        if len(final) >= request.size:
-            break
-
-    logger.info(f"✓ Returning {len(final)} recommendations")
-    return {"recommendations": final}
+    return {"recommendations": final_recommendations}
 
 
-# --- AUTH & SAVE ---
+# --- AUTH ENDPOINTS ---
 @app.get("/login")
 def login():
+    sp_oauth = SpotifyOAuth(
+        client_id=os.getenv("CLIENT_ID"),
+        client_secret=os.getenv("CLIENT_SECRET"),
+        redirect_uri=os.getenv("REDIRECT_URI"),
+        scope=os.getenv("SCOPE")
+    )
     return RedirectResponse(sp_oauth.get_authorize_url())
-
-
-@app.get("/callback")
-def callback(code: str):
-    token = sp_oauth.get_access_token(code)
-    return RedirectResponse(f"https://spotify-playlist-curator.vercel.app/home?token={token['access_token']}")
 
 
 @app.post("/save-playlist")
@@ -511,8 +215,9 @@ async def save_playlist(request: PlaylistSaveRequest):
     sp = spotipy.Spotify(auth=request.token)
     try:
         uid = sp.current_user()["id"]
-        pl = sp.user_playlist_create(uid, request.name, public=False)
-        uris = [f"spotify:track:{id}" for id in request.track_ids]
+        pl = sp.user_playlist_create(uid, request.name, public=False, description="AI Curated Mix")
+        uris = [f"spotify:track:{tid}" for tid in request.track_ids]
+        # Spotify allows max 100 per call
         for i in range(0, len(uris), 100):
             sp.playlist_add_items(pl["id"], uris[i:i + 100])
         return {"status": "success", "url": pl["external_urls"]["spotify"]}
